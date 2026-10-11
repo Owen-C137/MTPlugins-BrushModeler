@@ -1,0 +1,357 @@
+// BrushModeler: convert selected Radiant brush bounds to a BO3 xmodel asset.
+#define MODTOOLS_PLUGIN_IMPL
+#include "modtools_plugin.hpp"
+#include <windows.h>
+#include <commdlg.h>
+#include <shlobj.h>
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cctype>
+#include <cstdarg>
+#include <cstdio>
+#include <fstream>
+#include <filesystem>
+#include <atomic>
+#include <mutex>
+#include <regex>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+
+extern "C" IMAGE_DOS_HEADER __ImageBase;
+namespace {
+ModToolsPane g_pane{}; ModToolsWidget g_status{},g_count{},g_asset{},g_gdt{},g_outputDir{},g_modelStatus{},g_cancelLookup{};
+std::wstring g_log;
+struct QueuedModel { std::wstring bin; std::string guid,asset; std::array<float,3> origin{},angles{}; };
+std::vector<QueuedModel> g_queuedModels;
+std::thread g_buildThread,g_lookupThread; std::mutex g_buildMutex,g_fileLogMutex,g_lookupMutex; std::atomic_bool g_buildWorkerDone{false},g_lookupDone{false},g_lookupCancelRequested{false}; std::atomic_int g_buildPhase{0}; bool g_buildRunning=false,g_waitingRadiantRefresh=false; ULONGLONG g_refreshReadyAt=0,g_buildStartedAt=0,g_bannerUpdatedAt=0; int g_phaseShown=-1; std::vector<QueuedModel> g_lookupResults; std::string g_lookupError; ULONGLONG g_lookupStartedAt=0,g_lookupBannerAt=0; bool g_lookupRunning=false; std::string g_buildError,g_buildMap,g_buildAsset; std::vector<std::string> g_buildQueuedGuids,g_buildQueuedAssets,g_buildBrushGuids;
+volatile LONG g_exportStage=0;
+void FileLog(const char* fmt,...){std::lock_guard<std::mutex> lock(g_fileLogMutex);char msg[2048]{};va_list a;va_start(a,fmt);vsnprintf_s(msg,sizeof msg,_TRUNCATE,fmt,a);va_end(a);SYSTEMTIME t{};GetLocalTime(&t);char line[2300]{};int n=_snprintf_s(line,sizeof line,_TRUNCATE,"%04u-%02u-%02u %02u:%02u:%02u.%03u [tid=%lu] %s\r\n",t.wYear,t.wMonth,t.wDay,t.wHour,t.wMinute,t.wSecond,t.wMilliseconds,GetCurrentThreadId(),msg);if(n<=0)return;HANDLE h=CreateFileW(g_log.c_str(),FILE_APPEND_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr);if(h!=INVALID_HANDLE_VALUE){DWORD w=0;WriteFile(h,line,(DWORD)n,&w,nullptr);CloseHandle(h);}}
+void Log(const char* fmt,...){char msg[2048]{};va_list a;va_start(a,fmt);vsnprintf_s(msg,sizeof msg,_TRUNCATE,fmt,a);va_end(a);FileLog("%s",msg);rp::Log("%s",msg);}
+std::wstring Join(std::wstring a,const wchar_t* b){if(!a.empty()&&a.back()!=L'\\')a+=L'\\';a+=b;return a;}
+std::wstring Join(std::wstring a,const std::wstring& b){return Join(std::move(a),b.c_str());}
+std::wstring Utf8Wide(const std::string&s){if(s.empty())return{};int n=MultiByteToWideChar(CP_UTF8,0,s.c_str(),-1,nullptr,0);std::wstring w(n? n-1:0,L'\0');if(n)MultiByteToWideChar(CP_UTF8,0,s.c_str(),-1,&w[0],n);return w;}
+std::string WideUtf8(const std::wstring&s){if(s.empty())return{};int n=WideCharToMultiByte(CP_UTF8,0,s.c_str(),-1,nullptr,0,nullptr,nullptr);std::string v(n? n-1:0,'\0');if(n)WideCharToMultiByte(CP_UTF8,0,s.c_str(),-1,&v[0],n,nullptr,nullptr);return v;}
+void Status(const std::string&s,bool writeLog=true){std::string low=s;for(char&c:low)c=(char)tolower((unsigned char)c);const char*bg="#263744",*fg="#c8e4f5",*edge="#45a9e8";if(low.find("failed")!=std::string::npos||low.find("error")!=std::string::npos||low.find("could not")!=std::string::npos||low.find("access violation")!=std::string::npos||low.find("left in place")!=std::string::npos||low.find("undo was applied")!=std::string::npos){bg="#442629";fg="#ffd9d9";edge="#ec5b61";}else if(low.find("waiting for radiant")!=std::string::npos||low.find("catching up")!=std::string::npos){bg="#263744";fg="#c8e4f5";edge="#45a9e8";}else if(low.find("converted")!=std::string::npos||low.find("conversion success")!=std::string::npos){bg="#243d30";fg="#d5f6df";edge="#52c878";}else if(low.find("searching")!=std::string::npos||low.find("converting")!=std::string::npos||low.find("building")!=std::string::npos||low.find("compil")!=std::string::npos||low.find("updat")!=std::string::npos||low.find("adding model")!=std::string::npos){bg="#493b24";fg="#ffedc2";edge="#efad35";}else if(low.find("ready")!=std::string::npos||low.find("select")!=std::string::npos){bg="#243d30";fg="#d5f6df";edge="#52c878";}std::string escaped;escaped.reserve(s.size());for(char c:s){if(c=='&')escaped+="&amp;";else if(c=='<')escaped+="&lt;";else if(c=='>')escaped+="&gt;";else escaped+=c;}std::string html="<div style=\"background-color:"+std::string(bg)+";color:"+fg+";border:1px solid "+edge+";border-left:6px solid "+edge+";border-radius:4px;padding:9px 11px;font-size:13px;font-weight:600;\">"+escaped+"</div>";if(g_status&&rp::host->ui)rp::host->ui->SetLabelText(g_status,html.c_str());if(writeLog)Log("%s",s.c_str());}
+std::vector<ModToolsSelectedBrush> Selection(){return rp::GetSelection();}
+std::string Edit(ModToolsWidget w){return rp::EditText(w);}
+std::string LowerAscii(std::string s){for(char&c:s)if(c>='A'&&c<='Z')c=(char)(c-'A'+'a');return s;}
+std::string NextAssetName(const std::string&name){std::smatch m;static const std::regex suffix(R"rx(^(.*)_([0-9]+)$)rx");if(std::regex_match(name,m,suffix)){unsigned long long n=0;try{n=std::stoull(m[2].str());}catch(...){n=0;}return m[1].str()+"_"+std::to_string(n+1);}return name+"_1";}
+std::string UniqueAssetName(std::string name,const std::wstring&gdtPath){std::ifstream in(gdtPath,std::ios::binary);if(!in)return name;std::string text((std::istreambuf_iterator<char>(in)),{});std::unordered_map<std::string,bool>names;static const std::regex entry(R"rx("([^"]+)"\s*\(\s*"[^"]+"\s*\))rx");for(std::sregex_iterator it(text.begin(),text.end(),entry),last;it!=last;++it)names.emplace(LowerAscii((*it)[1].str()),true);std::string original=name;while(names.find(LowerAscii(name))!=names.end())name=NextAssetName(name);if(name!=original)Log("asset name collision resolved: requested=%s selected=%s",original.c_str(),name.c_str());return name;}
+struct V{float x,y,z;};
+struct Vec {float x,y,z;}; struct Plane{Vec n;float d;size_t raw;}; struct Tex{Vec p[3];std::string material;float hs=64,vs=64,hshift=0,vshift=0,rot=0;}; struct Face{std::vector<Vec> p;Vec n;std::string material;std::vector<std::pair<float,float>> uv;std::vector<Vec> normals;bool reverseWinding=true;};
+struct PatchGrid{int rows=0,cols=0;bool curve=false;std::string material;std::vector<Vec> p;std::vector<std::pair<float,float>> uv;};
+Vec Sub(Vec a,Vec b){return{a.x-b.x,a.y-b.y,a.z-b.z};} Vec Add(Vec a,Vec b){return{a.x+b.x,a.y+b.y,a.z+b.z};} Vec Mul(Vec a,float s){return{a.x*s,a.y*s,a.z*s};} float Dot(Vec a,Vec b){return a.x*b.x+a.y*b.y+a.z*b.z;} Vec Cross(Vec a,Vec b){return{a.y*b.z-a.z*b.y,a.z*b.x-a.x*b.z,a.x*b.y-a.y*b.x};} float Len(Vec a){return std::sqrt(Dot(a,a));}
+void ParseTex(const std::string& text,std::vector<Tex>& out){size_t p=0;while(p<text.size()){size_t e=text.find('\n',p);std::string line=text.substr(p,e==std::string::npos?e:e-p);p=e==std::string::npos?text.size():e+1;size_t s=line.find_first_not_of(" \t\r");if(s==std::string::npos||line[s]!='(')continue;Tex t;int used=0,used2=0;char name[256]{};const char*c=line.c_str()+s;if(sscanf_s(c," ( %f %f %f ) ( %f %f %f ) ( %f %f %f ) %n",&t.p[0].x,&t.p[0].y,&t.p[0].z,&t.p[1].x,&t.p[1].y,&t.p[1].z,&t.p[2].x,&t.p[2].y,&t.p[2].z,&used)<9||used<=0)continue;if(sscanf_s(c+used,"%255s %f %f %f %f %f%n",name,(unsigned)_countof(name),&t.hs,&t.vs,&t.hshift,&t.vshift,&t.rot,&used2)<6)continue;t.material=name;out.push_back(t);}}
+bool ParsePatch(const std::string&text,const char*guid,PatchGrid&out){out=PatchGrid{};if(!guid||!*guid)return false;std::string lower=text,needle=std::string("guid \"")+guid+"\"";for(char&c:lower)c=(char)tolower((unsigned char)c);for(char&c:needle)c=(char)tolower((unsigned char)c);size_t pos=lower.find(needle);if(pos==std::string::npos)return false;bool in=false,header=false;std::string lightmap;while(pos<text.size()){size_t e=text.find('\n',pos);std::string line=text.substr(pos,e==std::string::npos?std::string::npos:e-pos);pos=e==std::string::npos?text.size():e+1;size_t b=line.find_first_not_of(" \t\r");if(b==std::string::npos)continue;line.erase(0,b);while(!line.empty()&&(line.back()=='\r'||line.back()==' '||line.back()=='\t'))line.pop_back();if(line.rfind("guid",0)==0)continue;if(!in){if(line=="mesh"||line=="curve"){in=true;out.curve=line=="curve";continue;}return false;}if(line[0]=='{')continue;if(line[0]=='}')break;if(line[0]=='('||line[0]==')'||line.rfind("toolFlags",0)==0||line.rfind("smoothing",0)==0)continue;if(line[0]=='v'&&line.size()>1&&(line[1]==' '||line[1]=='\t')){Vec p{};float u=0,v=0;if(sscanf_s(line.c_str(),"v %f %f %f t %f %f",&p.x,&p.y,&p.z,&u,&v)!=5)return false;out.p.push_back(p);out.uv.push_back({u/1024.0f,v/1024.0f});continue;}if(!header){if(out.material.empty()){out.material=line;continue;}if(lightmap.empty()){lightmap=line;continue;}int r=0,c=0;if(sscanf_s(line.c_str(),"%d %d",&r,&c)==2&&r>=2&&c>=2&&r<=1024&&c<=1024&&(size_t)r*(size_t)c<=1048576){out.rows=r;out.cols=c;header=true;continue;}return false;}}if(!header||out.p.size()!=(size_t)out.rows*(size_t)out.cols||out.uv.size()!=out.p.size())return false;return true;}
+bool TessellatePatchCurve(const PatchGrid&g,PatchGrid&out){if(!g.curve||g.rows<3||g.cols<3||(g.rows&1)==0||(g.cols&1)==0)return false;int pr=(g.rows-1)/2,pc=(g.cols-1)/2;auto at=[&](int r,int c)->size_t{return(size_t)r*g.cols+c;};auto bend=[](Vec a,Vec b,Vec c){Vec d=Sub(Add(a,c),Mul(b,2));return Dot(d,d);};float br=0,bc=0;for(int i=0;i<pr;++i)for(int c=0;c<g.cols;++c)br=(std::max)(br,bend(g.p[at(2*i,c)],g.p[at(2*i+1,c)],g.p[at(2*i+2,c)]));for(int j=0;j<pc;++j)for(int r=0;r<g.rows;++r)bc=(std::max)(bc,bend(g.p[at(r,2*j)],g.p[at(r,2*j+1)],g.p[at(r,2*j+2)]));auto seg=[](float b){int n=2;while(n<8&&sqrtf(b)*.25f/(n*n)>.25f)n*=2;return n;};int nr=seg(br),nc=seg(bc);while(pr*nr*pc*nc>512&&(nr>1||nc>1)){if(pr*nr>=pc*nc&&nr>1)nr/=2;else if(nc>1)nc/=2;else nr/=2;}out=PatchGrid{};out.rows=pr*nr+1;out.cols=pc*nc+1;out.material=g.material;out.p.resize((size_t)out.rows*out.cols);out.uv.resize(out.p.size());for(int R=0;R<out.rows;++R){int i=(std::min)(R/nr,pr-1);float t=(float)(R-i*nr)/nr,wr[3]={(1-t)*(1-t),2*t*(1-t),t*t};for(int C=0;C<out.cols;++C){int j=(std::min)(C/nc,pc-1);float u=(float)(C-j*nc)/nc,wc[3]={(1-u)*(1-u),2*u*(1-u),u*u};Vec p{};float us=0,vs=0;for(int a=0;a<3;++a)for(int b=0;b<3;++b){float w=wr[a]*wc[b];size_t src=at(2*i+a,2*j+b);p=Add(p,Mul(g.p[src],w));us+=g.uv[src].first*w;vs+=g.uv[src].second*w;}size_t d=(size_t)R*out.cols+C;out.p[d]=p;out.uv[d]={us,vs};}}return true;}
+bool PatchFaces(const PatchGrid&src,std::vector<Face>&out){PatchGrid tess=src;if(src.curve&&!TessellatePatchCurve(src,tess))return false;if(tess.rows<2||tess.cols<2||tess.p.size()!=(size_t)tess.rows*tess.cols||tess.uv.size()!=tess.p.size())return false;auto idx=[&](int r,int c){return(size_t)r*tess.cols+c;};std::vector<std::array<size_t,3>> triangles;triangles.reserve((size_t)(tess.rows-1)*(tess.cols-1)*2);std::vector<Vec> normalSums(tess.p.size(),Vec{});for(int r=0;r<tess.rows-1;++r)for(int c=0;c<tess.cols-1;++c){size_t a=idx(r,c),b=idx(r,c+1),d=idx(r+1,c),e=idx(r+1,c+1);triangles.push_back({a,d,e});triangles.push_back({a,e,b});}for(const auto&t:triangles){Vec n=Cross(Sub(tess.p[t[1]],tess.p[t[0]]),Sub(tess.p[t[2]],tess.p[t[0]]));if(Len(n)<1e-6f)continue;for(size_t i:t)normalSums[i]=Add(normalSums[i],n);}for(Vec&n:normalSums){float l=Len(n);if(l>1e-6f)n=Mul(n,1.0f/l);}for(const auto&t:triangles){Vec p0=tess.p[t[0]],p1=tess.p[t[1]],p2=tess.p[t[2]],n=Cross(Sub(p1,p0),Sub(p2,p0));float l=Len(n);if(l<1e-6f)continue;Face f;f.p={p0,p1,p2};f.n=Mul(n,1.0f/l);f.material=tess.material;f.uv={tess.uv[t[0]],tess.uv[t[1]],tess.uv[t[2]]};for(size_t i:t)f.normals.push_back(Len(normalSums[i])>1e-6f?normalSums[i]:f.n);f.reverseWinding=true;out.push_back(std::move(f));}return true;}
+void FaceAxes(Vec n,const Tex&t,Vec&u,Vec&v){static const float a[18][3]={{0,0,1},{1,0,0},{0,-1,0},{0,0,-1},{1,0,0},{0,-1,0},{1,0,0},{0,1,0},{0,0,-1},{-1,0,0},{0,1,0},{0,0,-1},{0,1,0},{1,0,0},{0,0,-1},{0,-1,0},{1,0,0},{0,0,-1}};int best=0;float bd=-1e30f;for(int i=0;i<6;++i){float d=n.x*a[i*3][0]+n.y*a[i*3][1]+n.z*a[i*3][2];if(d>bd){best=i;bd=d;}}Vec x={a[best*3+1][0],a[best*3+1][1],a[best*3+1][2]},y={a[best*3+2][0],a[best*3+2][1],a[best*3+2][2]};if(t.rot!=0){float r=t.rot*3.14159265358979f/180,si=sin(r),co=cos(r);int sx=x.x?0:x.y?1:2,sy=y.x?0:y.y?1:2;float* xv=&x.x,*yv=&y.x;float nx=co*xv[sx]-si*xv[sy],ny=si*xv[sx]+co*xv[sy];xv[sx]=nx;xv[sy]=ny;nx=co*yv[sx]-si*yv[sy];ny=si*yv[sx]+co*yv[sy];yv[sx]=nx;yv[sy]=ny;}u=x;v=y;}
+std::pair<float,float> UV(Vec p,Vec u,Vec v,const Tex&t){float hs=fabsf(t.hs)<1e-6f?64:t.hs,vs=fabsf(t.vs)<1e-6f?64:t.vs;return{(Dot(p,u)+t.hshift)/hs,(Dot(p,v)+t.vshift)/vs};}
+bool Reconstruct(const ModToolsSelectedBrush&s,const std::vector<float>&raw,const std::vector<Tex>&tex,std::vector<Face>&out){if(raw.size()<36||raw.size()%9)return false;std::vector<Plane> planes;for(size_t i=0;i<raw.size()/9;++i){Vec a={raw[i*9],raw[i*9+1],raw[i*9+2]},b={raw[i*9+3],raw[i*9+4],raw[i*9+5]},c={raw[i*9+6],raw[i*9+7],raw[i*9+8]},n=Cross(Sub(b,a),Sub(c,a));float l=Len(n);if(l<1e-5f)continue;n=Mul(n,1/l);float d=Dot(n,a);bool dup=false;for(auto&p:planes)if(Dot(p.n,n)>.99999f&&fabsf(p.d-d)<.03125f){dup=true;break;}if(!dup)planes.push_back({n,d,i});}if(planes.size()<4)return false;
+ for(int flip=0;flip<2;++flip){std::vector<Plane> ps=planes;if(flip)for(auto&p:ps){p.n=Mul(p.n,-1);p.d=-p.d;}std::vector<Vec> verts;for(size_t i=0;i<ps.size();++i)for(size_t j=i+1;j<ps.size();++j)for(size_t k=j+1;k<ps.size();++k){auto&a=ps[i];auto&b=ps[j];auto&c=ps[k];Vec bc=Cross(b.n,c.n);float den=Dot(a.n,bc);if(fabsf(den)<1e-5f)continue;Vec x=Mul(Add(Add(Mul(bc,a.d),Mul(Cross(c.n,a.n),b.d)),Mul(Cross(a.n,b.n),c.d)),1/den);bool inside=true;for(auto&p:ps)if(Dot(p.n,x)>p.d+.125f){inside=false;break;}if(!inside||x.x<s.mins[0]-.5f||x.x>s.maxs[0]+.5f||x.y<s.mins[1]-.5f||x.y>s.maxs[1]+.5f||x.z<s.mins[2]-.5f||x.z>s.maxs[2]+.5f)continue;bool du=false;for(auto&v:verts)if(Dot(Sub(v,x),Sub(v,x))<.001f){du=true;break;}if(!du)verts.push_back(x);}if(verts.size()<4)continue;std::vector<Face> made;for(auto&p:ps){std::vector<Vec> corners;Vec center{};for(auto&v:verts)if(fabsf(Dot(p.n,v)-p.d)<.15625f){corners.push_back(v);center=Add(center,v);}if(corners.size()<3)continue;center=Mul(center,1.0f/corners.size());Vec u=Sub(corners[0],center);u=Mul(u,1/std::max(1e-5f,Len(u)));Vec v=Cross(p.n,u);std::sort(corners.begin(),corners.end(),[&](Vec a,Vec b){Vec aa=Sub(a,center),bb=Sub(b,center);return atan2f(Dot(aa,v),Dot(aa,u))<atan2f(Dot(bb,v),Dot(bb,u));});Vec area{};for(size_t i=1;i+1<corners.size();++i)area=Add(area,Cross(Sub(corners[i],corners[0]),Sub(corners[i+1],corners[0])));if(Dot(area,p.n)<0)std::reverse(corners.begin(),corners.end());Face f;f.p=corners;f.n=p.n;const Tex*t=nullptr;auto close=[](Vec a,Vec b){Vec d=Sub(a,b);return Dot(d,d)<.01f;};Vec ra={raw[p.raw*9],raw[p.raw*9+1],raw[p.raw*9+2]},rb={raw[p.raw*9+3],raw[p.raw*9+4],raw[p.raw*9+5]},rc={raw[p.raw*9+6],raw[p.raw*9+7],raw[p.raw*9+8]};for(auto&tx:tex)if(close(tx.p[0],ra)&&close(tx.p[1],rb)&&close(tx.p[2],rc)){t=&tx;break;}if(t){f.material=t->material;Vec tu,tv,rawN=Cross(Sub(rb,ra),Sub(rc,ra));float rawLen=Len(rawN);if(rawLen>1e-6f)rawN=Mul(rawN,1.0f/rawLen);FaceAxes(rawN,*t,tu,tv);for(auto&pt:corners)f.uv.push_back(UV(pt,tu,tv,*t));}else{f.material="caulk";for(auto&pt:corners)f.uv.push_back({0.0f,0.0f});}made.push_back(std::move(f));}if(made.size()>=4){out.insert(out.end(),made.begin(),made.end());return true;}}return false;}
+bool WriteExport(const std::wstring&path,const std::vector<ModToolsSelectedBrush>&sel,const std::vector<ModToolsBrush>&brushes,std::string&err){InterlockedExchange(&g_exportStage,1);if(sel.empty()){err="Select one or more brushes in Radiant first.";return false;}if(sel.size()>2000){err="Selection is too large (maximum 2,000 brushes per model).";return false;}float lo[3]={1e30f,1e30f,1e30f},hi[3]={-1e30f,-1e30f,-1e30f};for(auto&s:sel)for(int k=0;k<3;++k){lo[k]=(std::min)(lo[k],s.mins[k]);hi[k]=(std::max)(hi[k],s.maxs[k]);}Vec center={(lo[0]+hi[0])*.5f,(lo[1]+hi[1])*.5f,(lo[2]+hi[2])*.5f};std::vector<Face> faces;std::vector<std::string> mats;
+ std::vector<std::string> entityGuids;entityGuids.reserve(sel.size());for(const auto&b:sel)if(b.entityGuid[0]&&std::find(entityGuids.begin(),entityGuids.end(),b.entityGuid)==entityGuids.end())entityGuids.emplace_back(b.entityGuid);auto entityHandles=rp::FindEntitiesByGuid(entityGuids);std::unordered_map<std::string,ModToolsEntity> entitiesByGuid;entitiesByGuid.reserve(entityGuids.size());for(size_t i=0;i<entityGuids.size()&&i<entityHandles.size();++i)if(entityHandles[i])entitiesByGuid.emplace(entityGuids[i],entityHandles[i]);std::unordered_map<std::string,std::vector<ModToolsBrush>> brushesByEntity;for(size_t i=0;i<sel.size();++i)if(brushes[i]&&sel[i].entityGuid[0])brushesByEntity[sel[i].entityGuid].push_back(brushes[i]);std::unordered_map<std::string,std::vector<Tex>> texByEntity;std::unordered_map<std::string,std::string> textByEntity;textByEntity.reserve(brushesByEntity.size());texByEntity.reserve(brushesByEntity.size());InterlockedExchange(&g_exportStage,2);if(rp::Has(&rp::host->WriteEntityTextWith)&&rp::host->WriteEntityTextWith)for(auto&group:brushesByEntity){auto entity=entitiesByGuid.find(group.first);if(entity==entitiesByGuid.end())continue;std::string text;char*p=rp::host->WriteEntityTextWith(rp::self,entity->second,group.second.data(),group.second.size());if(p){text=p;rp::host->FreeString(rp::self,p);}auto&tex=texByEntity[group.first];ParseTex(text,tex);textByEntity.emplace(group.first,std::move(text));}Log("material capture batched: brushes=%zu owners=%zu",sel.size(),brushesByEntity.size());
+ for(size_t i=0;i<sel.size();++i){InterlockedExchange(&g_exportStage,3);if(!brushes[i]){Log("brush lookup failed guid=%s",sel[i].brushGuid);continue;}std::string guid=sel[i].entityGuid;auto textIt=textByEntity.find(guid);PatchGrid patch;size_t old=faces.size();bool isPatch=textIt!=textByEntity.end()&&ParsePatch(textIt->second,sel[i].brushGuid,patch);if(isPatch){InterlockedExchange(&g_exportStage,4);if(PatchFaces(patch,faces)){if(std::find(mats.begin(),mats.end(),patch.material)==mats.end())mats.push_back(patch.material);Log("patch captured guid=%s type=%s grid=%dx%d triangles=%zu material=%s",sel[i].brushGuid,patch.curve?"curve":"mesh",patch.rows,patch.cols,faces.size()-old,patch.material.c_str());continue;}Log("patch tessellation failed guid=%s type=%s grid=%dx%d",sel[i].brushGuid,patch.curve?"curve":"mesh",patch.rows,patch.cols);}InterlockedExchange(&g_exportStage,5);auto raw=rp::BrushPlanes(brushes[i]);static const std::vector<Tex> noTex;auto ti=texByEntity.find(guid);const auto&tex=ti==texByEntity.end()?noTex:ti->second;old=faces.size();if(!Reconstruct(sel[i],raw,tex,faces)){Log("brush reconstruction failed guid=%s planes=%zu patch_parse=%s",sel[i].brushGuid,raw.size()/9,textIt==textByEntity.end()?"no-text":"no-patch");continue;}for(size_t j=old;j<faces.size();++j)if(std::find(mats.begin(),mats.end(),faces[j].material)==mats.end())mats.push_back(faces[j].material);}
+ InterlockedExchange(&g_exportStage,6);if(faces.empty()||mats.empty()){err="Could not reconstruct selected brush faces. Check BrushModeler.log for the brush GUID and plane count.";return false;}InterlockedExchange(&g_exportStage,7);size_t nv=0,nf=0;for(auto&f:faces){nv+=(f.p.size()-2)*3;nf+=f.p.size()-2;}InterlockedExchange(&g_exportStage,8);std::ostringstream o;o<<"MODEL\nVERSION 6\n\nNUMBONES 1\nBONE 0 -1 \"tag_origin\"\n\nBONE 0\nOFFSET 0 0 0\nSCALE 1 1 1\nX 1 0 0\nY 0 1 0\nZ 0 0 1\n\nNUMVERTS "<<nv<<"\n\n";InterlockedExchange(&g_exportStage,9);size_t vi=0;for(auto&f:faces)for(size_t k=1;k+1<f.p.size();++k)for(int q=0;q<3;++q){size_t ci=q==0?0:q==1?(f.reverseWinding?k+1:k):(f.reverseWinding?k:k+1);Vec p=Sub(f.p[ci],center);o<<"VERT "<<vi++<<"\nOFFSET "<<p.x<<" "<<p.y<<" "<<p.z<<"\nBONES 1\nBONE 0 1\n\n";}o<<"NUMFACES "<<nf<<"\n\n";InterlockedExchange(&g_exportStage,10);vi=0;for(auto&f:faces){size_t mi=std::find(mats.begin(),mats.end(),f.material)-mats.begin();for(size_t k=1;k+1<f.p.size();++k){/* CoD xmodel_export brush faces use reversed winding; patches retain Radiant's visible-side order. */size_t cs[3]={0,f.reverseWinding?k+1:k,f.reverseWinding?k:k+1};o<<"TRI 0 "<<mi<<" 0 0\n";for(int q=0;q<3;++q){size_t ci=cs[q];Vec normal=f.normals.size()==f.p.size()?f.normals[ci]:f.n;o<<"VERT "<<vi++<<"\nNORMAL "<<normal.x<<" "<<normal.y<<" "<<normal.z<<"\nCOLOR 1 1 1 1\nUV 1 "<<f.uv[ci].first<<" "<<f.uv[ci].second<<"\n\n";}}}o<<"NUMOBJECTS 1\nOBJECT 0 \"selection\"\n\nNUMMATERIALS "<<mats.size()<<"\n";for(size_t i=0;i<mats.size();++i)o<<"MATERIAL "<<i<<" \""<<mats[i]<<"\" \"Lambert\" \"\"\nCOLOR 0 0 0 1\nTRANSPARENCY 0 0 0 1\nAMBIENTCOLOR 1 1 1 1\nINCANDESCENCE 0 0 0 1\nCOEFFS 0.8 0\nGLOW 0 0\nREFRACTIVE 6 1\nSPECULARCOLOR 0.5 0.5 0.5 1\nREFLECTIVECOLOR 0 0 0 1\nREFLECTIVE 1 0.5\nBLINN -1 -1\nPHONG -1\n";InterlockedExchange(&g_exportStage,11);std::ofstream f(path,std::ios::binary);std::string text=o.str();f.write(text.data(),text.size());if(!f){err="Could not write xmodel_export.";return false;}Log("export source written: brushes=%zu vertices=%zu triangles=%zu materials=%zu path=%s",sel.size(),nv,nf,mats.size(),WideUtf8(path).c_str());return true;}
+bool WriteExportProtected(const std::wstring&path,const std::vector<ModToolsSelectedBrush>&sel,const std::vector<ModToolsBrush>&brushes,std::string&err){__try{return WriteExport(path,sel,brushes,err);}__except(EXCEPTION_EXECUTE_HANDLER){LONG stage=InterlockedCompareExchange(&g_exportStage,0,0);FileLog("structured exception in geometry export: code=0x%08lX stage=%ld",GetExceptionCode(),stage);err="Radiant hit an access violation while exporting geometry (stage logged). See BrushModeler.log.";return false;}}
+int Run(const std::wstring&exe,const std::wstring&args,const std::wstring&cwd){std::wstring cmd=L"\""+exe+L"\" "+args;STARTUPINFOW si{};si.cb=sizeof si;PROCESS_INFORMATION pi{};if(!CreateProcessW(nullptr,cmd.data(),nullptr,nullptr,FALSE,CREATE_NO_WINDOW,nullptr,cwd.c_str(),&si,&pi)){FileLog("CreateProcess failed exe=%s error=%lu",WideUtf8(exe).c_str(),GetLastError());return -1;}CloseHandle(pi.hThread);DWORD wait=WaitForSingleObject(pi.hProcess,120000);DWORD code=999;if(wait==WAIT_TIMEOUT){TerminateProcess(pi.hProcess,124);WaitForSingleObject(pi.hProcess,5000);FileLog("process timed out exe=%s",WideUtf8(exe).c_str());}else if(wait==WAIT_OBJECT_0)GetExitCodeProcess(pi.hProcess,&code);CloseHandle(pi.hProcess);FileLog("process completed exit=%lu exe=%s",code,WideUtf8(exe).c_str());return wait==WAIT_OBJECT_0?(int)code:-1;}
+std::wstring GameRoot(){return rp::host->RadiantRoot?rp::host->RadiantRoot(rp::self):L"";}
+using ReloadCameraAssetsFn=__int64(__fastcall*)(void*,unsigned char);
+bool ForceCameraAssetRefreshSeh(void**mainWinPtr,void*reloadAddress){__try{if(!mainWinPtr||!*mainWinPtr||!reloadAddress)return false;auto*mainWin=reinterpret_cast<unsigned char*>(*mainWinPtr);auto*children=*reinterpret_cast<unsigned char**>(mainWin+64);if(!children)return false;auto*cam=*reinterpret_cast<unsigned char**>(children+240);if(!cam)return false;reinterpret_cast<ReloadCameraAssetsFn>(reloadAddress)(cam,1);return true;}__except(EXCEPTION_EXECUTE_HANDLER){return false;}}
+bool ForceRadiantAssetRefresh(){if(!rp::Has(&rp::host->RadiantAddress)||!rp::host->RadiantAddress)return false;auto**mainWinPtr=static_cast<void**>(rp::host->RadiantAddress(rp::self,0x1444C6560));auto*reload=rp::host->RadiantAddress(rp::self,0x140238300);bool ok=ForceCameraAssetRefreshSeh(mainWinPtr,reload);Log("Radiant camera asset refresh %s",ok?"requested":"unavailable or failed");return ok;}
+bool FindModelSource(const std::string& asset, const std::wstring& root, std::wstring& bin, std::wstring& gdtPath, const std::atomic_bool& cancel)
+{
+ namespace fs = std::filesystem;
+ if (cancel.load(std::memory_order_relaxed)) return false;
+ static std::unordered_map<std::string, std::pair<std::wstring, std::wstring>> cache;
+ std::string cacheKey = asset;
+ std::transform(cacheKey.begin(), cacheKey.end(), cacheKey.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+ if (auto cached = cache.find(cacheKey); cached != cache.end())
+ {
+  std::error_code ec;
+  if (fs::exists(cached->second.first, ec)) { bin = cached->second.first; gdtPath = cached->second.second; FileLog("model source cache hit: asset=%s", asset.c_str()); return true; }
+  cache.erase(cached);
+ }
+ const std::regex entry(R"rx("([^"]+)"\s*\(\s*"xmodel\.gdf"\s*\)\s*\{([^}]*)\})rx", std::regex::icase);
+ const std::regex file(R"rx("filename"\s+"([^"]+)")rx", std::regex::icase);
+ auto readGdt = [&](const fs::path& path, bool databaseHit) -> bool {
+  if (cancel.load(std::memory_order_relaxed)) return false;
+  std::error_code ec;
+  if (!fs::is_regular_file(path, ec)) return false;
+  auto size = fs::file_size(path, ec);
+  if (ec || size > 64ull * 1024 * 1024) return false;
+  std::ifstream in(path, std::ios::binary);
+  if (!in) return false;
+  std::string text((std::istreambuf_iterator<char>(in)), {});
+  for (std::sregex_iterator m(text.begin(), text.end(), entry), last; m != last; ++m)
+  {
+   if (cancel.load(std::memory_order_relaxed)) return false;
+   if (_stricmp((*m)[1].str().c_str(), asset.c_str()) != 0) continue;
+   std::smatch fm;
+   std::string body = (*m)[2].str();
+   if (!std::regex_search(body, fm, file)) continue;
+   std::wstring rel = Utf8Wide(fm[1].str());
+   std::replace(rel.begin(), rel.end(), L'/', L'\\');
+   fs::path relative(rel);
+   fs::path candidate = relative.is_absolute() ? relative : fs::path(root) / L"model_export" / relative;
+   if (!fs::exists(candidate, ec)) return false;
+   bin = candidate.wstring(); gdtPath = path.wstring(); cache[cacheKey] = {bin, gdtPath};
+   FileLog("model GDT resolved: asset=%s gdt=%s bin=%s lookup=%s", asset.c_str(), WideUtf8(gdtPath).c_str(), WideUtf8(bin).c_str(), databaseHit ? "gdt.db" : "fallback");
+   return true;
+  }
+  return false;
+ };
+ // gdt.db is the same indexed asset catalog Radiant uses. Resolve the GDT first so normal
+ // model lookups read one small file instead of recursively scanning every source GDT.
+ ULONGLONG dbStarted = GetTickCount64();
+ HMODULE sqlite = LoadLibraryW((fs::path(root) / L"bin" / L"sqlite64r.dll").c_str());
+ if (sqlite && !cancel.load(std::memory_order_relaxed))
+ {
+  using OpenFn = int (*)(const char*, void**, int, const char*);
+  using PrepareFn = int (*)(void*, const char*, int, void**, const char**);
+  using BindFn = int (*)(void*, int, const char*, int, void*);
+  using StepFn = int (*)(void*);
+  using ColumnFn = const unsigned char* (*)(void*, int);
+  using FinalizeFn = int (*)(void*);
+  using CloseFn = int (*)(void*);
+  auto open = reinterpret_cast<OpenFn>(GetProcAddress(sqlite, "sqlite3_open_v2"));
+  auto prepare = reinterpret_cast<PrepareFn>(GetProcAddress(sqlite, "sqlite3_prepare_v2"));
+  auto bind = reinterpret_cast<BindFn>(GetProcAddress(sqlite, "sqlite3_bind_text"));
+  auto step = reinterpret_cast<StepFn>(GetProcAddress(sqlite, "sqlite3_step"));
+  auto column = reinterpret_cast<ColumnFn>(GetProcAddress(sqlite, "sqlite3_column_text"));
+  auto finalize = reinterpret_cast<FinalizeFn>(GetProcAddress(sqlite, "sqlite3_finalize"));
+  auto close = reinterpret_cast<CloseFn>(GetProcAddress(sqlite, "sqlite3_close"));
+  if (open && prepare && bind && step && column && finalize && close)
+  {
+   std::string dbFile = WideUtf8((fs::path(root) / L"gdtdb" / L"gdt.db").wstring());
+   void* db = nullptr;
+   if (open(dbFile.c_str(), &db, 0x00000001 | 0x00010000, nullptr) == 0)
+   {
+    const char* sql = "SELECT t.name FROM _entity e JOIN _gdf g ON e.FK_gdf=g.PK_id JOIN _gdt t ON e.FK_gdt=t.PK_id WHERE e.name=?1 AND g.name=?2";
+    void* stmt = nullptr;
+    if (prepare(db, sql, -1, &stmt, nullptr) == 0)
+    {
+     bind(stmt, 1, asset.c_str(), -1, nullptr);
+     bind(stmt, 2, "xmodel", -1, nullptr);
+     if (step(stmt) == 100)
+     {
+      const unsigned char* value = column(stmt, 0);
+      if (value)
+      {
+       fs::path indexedGdt = Utf8Wide(reinterpret_cast<const char*>(value));
+       if (!indexedGdt.is_absolute()) indexedGdt = fs::path(root) / indexedGdt;
+       if (readGdt(indexedGdt, true)) { finalize(stmt); close(db); FreeLibrary(sqlite); FileLog("model lookup indexed in %llu ms", GetTickCount64() - dbStarted); return true; }
+      }
+     }
+     finalize(stmt);
+    }
+    close(db);
+   }
+  }
+  FreeLibrary(sqlite);
+ }
+ if (cancel.load(std::memory_order_relaxed)) return false;
+ FileLog("model gdt.db lookup missed or unavailable: asset=%s elapsed_ms=%llu; using fallback scan", asset.c_str(), GetTickCount64() - dbStarted);
+ std::vector<fs::path> roots = {fs::path(root) / L"source_data", fs::path(root) / L"_custom"};
+ for (const auto& scanRoot : roots)
+ {
+  if (cancel.load(std::memory_order_relaxed)) return false;
+  std::error_code ec;
+  if (!fs::exists(scanRoot, ec)) continue;
+  for (fs::recursive_directory_iterator it(scanRoot, fs::directory_options::skip_permission_denied, ec), end; it != end; it.increment(ec))
+  {
+   if (cancel.load(std::memory_order_relaxed)) return false;
+   if (ec) { ec.clear(); continue; }
+   if (!it->is_regular_file(ec) || _wcsicmp(it->path().extension().c_str(), L".gdt") != 0) continue;
+   if (readGdt(it->path(), false)) return true;
+  }
+ }
+ return false;
+}
+void OnCancelLookup(void*)
+{
+ if (!g_lookupRunning) return;
+ g_lookupCancelRequested.store(true, std::memory_order_relaxed);
+ if (rp::host->ui) rp::host->ui->SetEnabled(g_cancelLookup, 0);
+ Status("Cancelling model search… waiting for the current file check to finish.");
+ FileLog("model source lookup cancellation requested");
+}
+void FinishModelLookup()
+{
+ if(!g_lookupRunning||!g_lookupDone.load(std::memory_order_acquire))return;
+ if(g_lookupThread.joinable())g_lookupThread.join();
+ std::vector<QueuedModel> found;std::string error;
+ {std::lock_guard<std::mutex> lock(g_lookupMutex);found=g_lookupResults;error=g_lookupError;}
+ g_lookupRunning=false;g_lookupDone.store(false,std::memory_order_release);if(rp::host->ui){rp::host->ui->SetVisible(g_cancelLookup,0);rp::host->ui->SetEnabled(g_cancelLookup,1);}
+ if(g_lookupCancelRequested.exchange(false,std::memory_order_relaxed)){Status("Model search cancelled. Previously queued models were kept.");if(g_modelStatus&&rp::host->ui)rp::host->ui->SetLabelText(g_modelStatus,"Model search cancelled. Previously queued models were kept.");return;}
+ if(!error.empty()){if(g_modelStatus&&rp::host->ui)rp::host->ui->SetLabelText(g_modelStatus,error.c_str());Status(error);return;}
+ g_queuedModels=std::move(found);
+ std::string label="Models ready to merge: "+std::to_string(g_queuedModels.size());
+ if(g_modelStatus&&rp::host->ui)rp::host->ui->SetLabelText(g_modelStatus,label.c_str());Status(label);
+ for(const auto&m:g_queuedModels)FileLog("selected model queued guid=%s asset=%s origin=%.3f %.3f %.3f angles=%.3f %.3f %.3f",m.guid.c_str(),m.asset.c_str(),m.origin[0],m.origin[1],m.origin[2],m.angles[0],m.angles[1],m.angles[2]);
+}
+void OnQueueModel(void*)
+{
+ try{
+  if(g_lookupRunning){Status("Model lookup is already running.");return;}
+  if(g_buildRunning){Status("Wait for the current model build to finish before queuing models.");return;}
+  auto selection=Selection();std::vector<std::string> ids;
+  for(auto&s:selection)if(s.entityGuid[0]&&std::find(ids.begin(),ids.end(),s.entityGuid)==ids.end())ids.push_back(s.entityGuid);
+  auto entities=rp::FindEntitiesByGuid(ids);std::vector<QueuedModel> requested;
+  for(size_t i=0;i<ids.size()&&i<entities.size();++i){if(!entities[i])continue;std::string model=rp::GetKey(entities[i],"model");if(model.empty())continue;
+   if(model.rfind("xmodel,",0)==0)model.erase(0,7);while(!model.empty()&&(model[0]=='/'||model[0]=='\\'))model.erase(model.begin());
+   QueuedModel q;q.guid=ids[i];q.asset=model;std::string o=rp::GetKey(entities[i],"origin"),a=rp::GetKey(entities[i],"angles");
+   sscanf_s(o.c_str(),"%f %f %f",&q.origin[0],&q.origin[1],&q.origin[2]);
+   if(sscanf_s(a.c_str(),"%f %f %f",&q.angles[0],&q.angles[1],&q.angles[2])<3){std::string yaw=rp::GetKey(entities[i],"angle");sscanf_s(yaw.c_str(),"%f",&q.angles[1]);}
+   if(std::none_of(requested.begin(),requested.end(),[&](const QueuedModel&v){return v.guid==q.guid;}))requested.push_back(std::move(q));
+  }
+  if(requested.empty()){Status("Select one or more Radiant model entities, then click Queue selected models.");return;}
+  if(g_lookupThread.joinable())g_lookupThread.join();g_lookupCancelRequested.store(false,std::memory_order_relaxed);g_lookupDone.store(false,std::memory_order_release);g_lookupRunning=true;g_lookupStartedAt=GetTickCount64();g_lookupBannerAt=0;if(rp::host->ui){rp::host->ui->SetEnabled(g_cancelLookup,1);rp::host->ui->SetVisible(g_cancelLookup,1);}
+  size_t requestedCount=requested.size();std::wstring root=GameRoot();g_lookupThread=std::thread([root,requested=std::move(requested)]()mutable{
+   std::string error;FileLog("model source lookup started: selected_models=%zu",requested.size());
+   try{for(auto&m:requested){if(g_lookupCancelRequested.load(std::memory_order_relaxed))break;std::wstring gdt;if(!FindModelSource(m.asset,root,m.bin,gdt,g_lookupCancelRequested)){if(!g_lookupCancelRequested.load(std::memory_order_relaxed))error="Could not find model "+m.asset+" in source_data or _custom GDT files.";break;}FileLog("model source resolved: asset=%s bin=%s",m.asset.c_str(),WideUtf8(m.bin).c_str());}}
+   catch(...){error="Model source lookup failed. See BrushModeler.log.";FileLog("exception while searching selected model GDTs");}
+   {std::lock_guard<std::mutex> lock(g_lookupMutex);g_lookupResults=std::move(requested);g_lookupError=std::move(error);}g_lookupDone.store(true,std::memory_order_release);
+  });
+  std::string label="Searching source GDTs for "+std::to_string(requested.size())+" model(s)...";if(g_modelStatus&&rp::host->ui)rp::host->ui->SetLabelText(g_modelStatus,label.c_str());Status(label);
+ }catch(...){Status("Could not read selected models. See BrushModeler.log.");Log("exception while starting model lookup");}
+}
+int CALLBACK OutputFolderBrowseCallback(HWND hwnd,UINT msg,LPARAM,LPARAM data){if(msg==BFFM_INITIALIZED&&data)SendMessageW(hwnd,BFFM_SETSELECTIONW,TRUE,data);return 0;}
+void OnBrowseOutput(void*){std::wstring current=Utf8Wide(Edit(g_outputDir));if(current.empty())current=Join(Join(GameRoot(),L"model_export"),L"_brush_modeler");std::wstring title=L"Choose the folder for generated XModel files";BROWSEINFOW bi{};bi.hwndOwner=(HWND)rp::host->MainWindow(rp::self);bi.lpszTitle=title.c_str();bi.ulFlags=BIF_RETURNONLYFSDIRS|BIF_NEWDIALOGSTYLE;bi.lpfn=OutputFolderBrowseCallback;bi.lParam=(LPARAM)current.c_str();PIDLIST_ABSOLUTE id=SHBrowseForFolderW(&bi);if(!id)return;wchar_t path[MAX_PATH]{};if(SHGetPathFromIDListW(id,path)){std::string value=WideUtf8(path);rp::host->ui->SetEditText(g_outputDir,value.c_str());rp::ConfigSet("model","output_dir",value);Log("custom output folder selected: %s",value.c_str());}CoTaskMemFree(id);}
+void OnBrowseGdt(void*){wchar_t file[MAX_PATH]{};OPENFILENAMEW d{};d.lStructSize=sizeof d;d.hwndOwner=(HWND)rp::host->MainWindow(rp::self);d.lpstrFilter=L"GDT files (*.gdt)\0*.gdt\0All files (*.*)\0*.*\0";d.lpstrFile=file;d.nMaxFile=MAX_PATH;d.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST|OFN_NOCHANGEDIR;if(GetOpenFileNameW(&d)){rp::host->ui->SetEditText(g_gdt,WideUtf8(file).c_str());rp::ConfigSet("model","gdt",WideUtf8(file));}}
+void FinishBuild()
+{
+ if(!g_buildRunning||!g_buildWorkerDone.load(std::memory_order_acquire))return;
+ if(g_buildThread.joinable())g_buildThread.join();
+ std::string error,map,asset;std::vector<std::string> brushGuids,queuedGuids,queuedAssets;
+ {std::lock_guard<std::mutex> lock(g_buildMutex);error=g_buildError;map=g_buildMap;asset=g_buildAsset;queuedGuids=g_buildQueuedGuids;queuedAssets=g_buildQueuedAssets;brushGuids=g_buildBrushGuids;}
+ g_buildRunning=false;g_buildWorkerDone.store(false,std::memory_order_release);g_buildPhase.store(6,std::memory_order_release);
+ if(!error.empty()){Status(error);return;}
+ std::vector<ModToolsBrush> brushes;
+ if(!brushGuids.empty()){brushes=rp::FindBrushesByGuid(brushGuids);if(brushes.size()!=brushGuids.size()||std::any_of(brushes.begin(),brushes.end(),[](ModToolsBrush b){return !b;})){Status("XModel built, but Radiant selection changed maps before replacement; original brushes were left in place.");Log("map replacement skipped: source brushes no longer exist");return;}}
+ Status("Radiant is adding the model and replacing the selected geometry...");if(rp::Has(&rp::host->BeginUndo)&&rp::host->BeginUndo)rp::host->BeginUndo(rp::self,"Build combined XModel");
+ int imported=rp::Has(&rp::host->ImportMapText)&&rp::host->ImportMapText?rp::host->ImportMapText(rp::self,map.c_str(),"Build combined XModel"):0;
+ if(!imported){if(rp::Has(&rp::host->EndUndo)&&rp::host->EndUndo)rp::host->EndUndo(rp::self);Status("Model asset built, but Radiant could not add it; the selected objects were left in place.");return;}
+ if(!brushes.empty()){
+  int deleted=rp::Has(&rp::host->DeleteBrushes)&&rp::host->DeleteBrushes?rp::host->DeleteBrushes(rp::self,brushes.data(),brushes.size(),"Build combined XModel"):0;
+  if(!deleted){if(rp::Has(&rp::host->EndUndo)&&rp::host->EndUndo)rp::host->EndUndo(rp::self);if(rp::Has(&rp::host->TriggerMenuAction)&&rp::host->TriggerMenuAction)rp::host->TriggerMenuAction(rp::self,"Edit/Undo");Status("Model asset built, but brush replacement failed. Radiant undo was applied; see log.");Log("replacement failed: brush deletion returned false");return;}
+ }
+ std::vector<std::string> importedGuids=rp::SelectedEntityGuids();std::string outputGuid=importedGuids.empty()?std::string():importedGuids.back();
+ if(!queuedGuids.empty()&&rp::Has(&rp::host->SelectEntityByGuid)&&rp::host->SelectEntityByGuid&&rp::Has(&rp::host->TriggerMenuAction)&&rp::host->TriggerMenuAction){
+  for(const auto&guid:queuedGuids){rp::host->DeselectAll(rp::self);if(rp::host->SelectEntityByGuid(rp::self,guid.c_str())){int del=rp::host->TriggerMenuAction(rp::self,"Edit/Delete");Log("source model entity removed after merge guid=%s command_result=%d",guid.c_str(),del);}else Log("source model entity removal skipped: guid no longer exists=%s",guid.c_str());}
+ }
+ if(rp::Has(&rp::host->EndUndo)&&rp::host->EndUndo)rp::host->EndUndo(rp::self);
+ if(!outputGuid.empty()&&rp::Has(&rp::host->SelectEntityByGuid)&&rp::host->SelectEntityByGuid){rp::host->DeselectAll(rp::self);rp::host->SelectEntityByGuid(rp::self,outputGuid.c_str());}
+ if(rp::Has(&rp::host->MarkMapModified)&&rp::host->MarkMapModified)rp::host->MarkMapModified(rp::self);
+ bool cameraRefresh=ForceRadiantAssetRefresh();if(rp::Has(&rp::host->RequestRedraw)&&rp::host->RequestRedraw)rp::host->RequestRedraw(rp::self,MODTOOLS_VIEW_3D);Status(cameraRefresh?"Converted. Refreshed the Radiant 3D view.":"Converted. Requested a 3D redraw; asset refresh was unavailable.");g_waitingRadiantRefresh=true;g_refreshReadyAt=GetTickCount64()+250;g_phaseShown=-1;
+ Log("conversion success asset=%s brush_count=%zu merged_model_count=%zu",asset.c_str(),brushes.size(),queuedGuids.size());
+ std::string nextAsset=NextAssetName(asset);if(g_asset&&rp::host->ui)rp::host->ui->SetEditText(g_asset,nextAsset.c_str());Log("next model asset name set to %s",nextAsset.c_str());
+ g_queuedModels.clear();if(g_modelStatus&&rp::host->ui)rp::host->ui->SetLabelText(g_modelStatus,"No models queued.");
+}
+bool WriteEmptyExport(const std::wstring&path,std::string&err){std::ofstream f(path,std::ios::binary);if(!f){err="Could not write empty XModel base export.";return false;}f<<"MODEL\nVERSION 6\n\nNUMBONES 1\nBONE 0 -1 \"tag_origin\"\n\nBONE 0\nOFFSET 0 0 0\nSCALE 1 1 1\nX 1 0 0\nY 0 1 0\nZ 0 0 1\n\nNUMVERTS 0\n\nNUMFACES 0\n\nNUMOBJECTS 0\n\nNUMMATERIALS 0\n";return !!f;}
+void OnConvert(void*)
+{
+ try{
+  if(g_lookupRunning){Status("Wait for the selected model lookup to finish before starting a build.");return;}
+  if(g_buildRunning){Status("A model build is already running.");return;}if(g_buildThread.joinable())g_buildThread.join();
+  auto rawSelection=Selection();std::vector<ModToolsSelectedBrush>s;std::vector<std::string>guids;size_t skippedQueuedModel=0;
+  for(auto&item:rawSelection)if(item.brushGuid[0]){
+   if(item.entityGuid[0]&&std::any_of(g_queuedModels.begin(),g_queuedModels.end(),[&](const QueuedModel&m){return m.guid==item.entityGuid;})){++skippedQueuedModel;Log("queued model selection proxy excluded from brush capture: guid=%s brush_guid=%s",item.entityGuid,item.brushGuid);continue;}
+   s.push_back(item);guids.emplace_back(item.brushGuid);
+  }
+  Log("build requested selected_items=%zu brush_items=%zu skipped_queued_model_proxies=%zu queued_models=%zu",rawSelection.size(),s.size(),skippedQueuedModel,g_queuedModels.size());
+  if(s.empty()&&g_queuedModels.empty()){Status("Select brushes or patches, or queue one or more selected models first.");return;}
+  std::string asset=Edit(g_asset),gdtText=Edit(g_gdt);if(asset.empty()||gdtText.empty()){Status("Enter an asset name and choose a GDT file.");return;}
+  for(char&c:asset)if(!((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_'))c='_';asset=UniqueAssetName(asset,Utf8Wide(gdtText));
+  auto foundBrushes=rp::FindBrushesByGuid(guids);std::vector<ModToolsSelectedBrush>validSelection;std::vector<ModToolsBrush>brushes;
+  for(size_t i=0;i<foundBrushes.size()&&i<s.size();++i)if(foundBrushes[i]){validSelection.push_back(s[i]);brushes.push_back(foundBrushes[i]);}
+  s.swap(validSelection);if(!s.empty()&&s.size()!=guids.size())Log("some selected geometry items could not be resolved: resolved=%zu requested=%zu",s.size(),guids.size());
+  if(s.empty()&&g_queuedModels.empty()){Status("The current selection has no convertible brushes. Check BrushModeler.log.");return;}
+  float center[3]{};
+  if(!s.empty()){float lo[3]={1e30f,1e30f,1e30f},hi[3]={-1e30f,-1e30f,-1e30f};for(const auto&b:s)for(int k=0;k<3;++k){lo[k]=(std::min)(lo[k],b.mins[k]);hi[k]=(std::max)(hi[k],b.maxs[k]);}for(int k=0;k<3;++k)center[k]=(lo[k]+hi[k])*.5f;}
+  else{for(const auto&m:g_queuedModels)for(int k=0;k<3;++k)center[k]+=m.origin[k];for(int k=0;k<3;++k)center[k]/=(float)g_queuedModels.size();}
+  std::wstring root=GameRoot();std::string outputValue=Edit(g_outputDir);std::wstring outDir=outputValue.empty()?Join(Join(root,L"model_export"),L"_brush_modeler"):Utf8Wide(outputValue);if(outDir.empty()){Status("Choose a valid output folder.");return;}std::error_code pathError;std::filesystem::path absOut=std::filesystem::absolute(std::filesystem::path(outDir),pathError).lexically_normal();if(pathError){Status("Could not resolve the selected output folder.");return;}outDir=absOut.wstring();std::filesystem::path modelExportRoot=std::filesystem::path(root)/L"model_export";std::filesystem::path relativeOut=absOut.lexically_relative(modelExportRoot.lexically_normal());if(relativeOut.empty()){Status("The output folder must be on the same drive as the BO3 model_export folder so the GDT can reference it.");return;}std::error_code createError;std::filesystem::create_directories(absOut,createError);if(createError){Status("Could not create the selected output folder.");Log("output directory creation failed path=%s error=%lu",WideUtf8(outDir).c_str(),createError.value());return;}rp::ConfigSet("model","output_dir",WideUtf8(outDir));std::string relativeOutput=WideUtf8(relativeOut.wstring());std::replace(relativeOutput.begin(),relativeOutput.end(),'/', '\\');std::string gdtOutputPath;for(char c:relativeOutput){gdtOutputPath.push_back(c);if(c=='\\')gdtOutputPath.push_back('\\');}Log("model output folder: %s gdt_relative=%s",WideUtf8(outDir).c_str(),gdtOutputPath.c_str());
+  std::wstring exp=Join(outDir,Utf8Wide(asset)+L".xmodel_export"),baseExp=g_queuedModels.empty()?exp:Join(outDir,Utf8Wide(asset)+L"_base.xmodel_export");std::string err;
+  g_buildPhase.store(1,std::memory_order_release);g_buildStartedAt=GetTickCount64();g_bannerUpdatedAt=0;g_phaseShown=-1;
+  if(!s.empty()){Status("Converting selected brush and patch geometry...");auto geometryStart=GetTickCount64();if(!WriteExportProtected(baseExp,s,brushes,err)){Status(err);return;}Log("geometry capture/export took_ms=%llu brushes=%zu",(unsigned long long)(GetTickCount64()-geometryStart),s.size());}
+  else if(!WriteEmptyExport(baseExp,err)){Status(err);return;}
+  std::vector<std::string>brushGuids;brushGuids.reserve(s.size());for(const auto&b:s)brushGuids.emplace_back(b.brushGuid);
+  std::vector<QueuedModel> queued=g_queuedModels;std::vector<std::string>queuedGuids,queuedAssets;for(const auto&m:queued){queuedGuids.push_back(m.guid);queuedAssets.push_back(m.asset);}
+  std::wstring pluginDir=rp::PluginDir();std::array<float,3> centerArray{center[0],center[1],center[2]};
+  {std::lock_guard<std::mutex> lock(g_buildMutex);g_buildError.clear();g_buildMap.clear();g_buildAsset=asset;g_buildQueuedGuids=queuedGuids;g_buildQueuedAssets=queuedAssets;g_buildBrushGuids=brushGuids;}
+  g_buildWorkerDone.store(false,std::memory_order_release);g_buildPhase.store(2,std::memory_order_release);g_buildRunning=true;
+  g_buildThread=std::thread([root,outDir,exp,baseExp,asset,gdtText,queued=std::move(queued),brushGuids,pluginDir,centerArray,gdtOutputPath]()mutable{
+   std::string error,map;auto fail=[&](const std::string&m){error=m;};
+   do{
+    std::wstring workingExport=baseExp;std::wstring exportx=Join(Join(pluginDir,L"Tools"),L"exportx.exe"),mergeTool=Join(pluginDir,L"merge_xmodels.exe");
+    if(GetFileAttributesW(mergeTool.c_str())==INVALID_FILE_ATTRIBUTES){fail("Brush Modeler merge helper is missing. Reinstall the plugin folder.");FileLog("merge helper missing path=%s",WideUtf8(mergeTool).c_str());break;}
+    if(!queued.empty()&&GetFileAttributesW(exportx.c_str())==INVALID_FILE_ATTRIBUTES){fail("Brush Modeler could not find its bundled ExportX tool. Reinstall the plugin folder.");FileLog("bundled ExportX missing path=%s",WideUtf8(exportx).c_str());break;}
+    for(size_t i=0;i<queued.size();++i){const auto&m=queued[i];g_buildPhase.store(2,std::memory_order_release);
+     std::wstring suffix=std::to_wstring(i);std::wstring sourceBin=Join(outDir,L"queued_source_"+suffix+L".xmodel_bin"),sourceExp=Join(outDir,L"queued_source_"+suffix+L".xmodel_export");DeleteFileW(sourceBin.c_str());DeleteFileW(sourceExp.c_str());
+     if(!CopyFileW(m.bin.c_str(),sourceBin.c_str(),FALSE)){fail("Could not stage selected model "+m.asset+". See BrushModeler.log.");FileLog("model staging copy failed asset=%s error=%lu",m.asset.c_str(),GetLastError());break;}
+     std::wstring exportArgs=L"-f \""+sourceBin.substr(sourceBin.find_last_of(L"\\/")+1)+L"\" -m export";
+     if(Run(exportx,exportArgs,outDir)!=0||GetFileAttributesW(sourceExp.c_str())==INVALID_FILE_ATTRIBUTES){fail("ExportX could not export selected model "+m.asset+". See BrushModeler.log.");break;}
+     std::wostringstream args;args<<L"\""<<workingExport<<L"\" \""<<sourceExp<<L"\" "<<m.origin[0]<<L" "<<m.origin[1]<<L" "<<m.origin[2]<<L" "<<centerArray[0]<<L" "<<centerArray[1]<<L" "<<centerArray[2]<<L" "<<m.angles[0]<<L" "<<m.angles[1]<<L" "<<m.angles[2];if(i==0&&brushGuids.empty())args<<L" --allow-empty-base";
+     if(Run(mergeTool,args.str(),outDir)!=0){fail("Model merge failed for "+m.asset+". Check BrushModeler.log and the bundled merge helper.");break;}
+     if(i==0&&brushGuids.empty()){if(!MoveFileExW(workingExport.c_str(),exp.c_str(),MOVEFILE_REPLACE_EXISTING)){fail("Could not finalize the models-only XModel export.");FileLog("could not finalize models-only export error=%lu",GetLastError());break;}workingExport=exp;}
+     FileLog("selected model merged: index=%zu asset=%s source=%s",i,m.asset.c_str(),WideUtf8(m.bin).c_str());
+    }
+    if(!error.empty())break;
+    if(queued.empty()){std::wostringstream args;args<<L"--optimize-only \""<<exp<<L"\"";if(Run(mergeTool,args.str(),outDir)!=0){fail("Mesh cleanup failed for the brush/patch model. Check BrushModeler.log and the bundled merge helper.");break;}}
+    if(!queued.empty()&&!brushGuids.empty()&&workingExport!=exp){if(!MoveFileExW(workingExport.c_str(),exp.c_str(),MOVEFILE_REPLACE_EXISTING)){fail("Could not finalize the merged XModel export.");FileLog("could not finalize merged export error=%lu",GetLastError());break;}}
+    g_buildPhase.store(3,std::memory_order_release);std::wstring bin=Join(outDir,Utf8Wide(asset)+L".xmodel_bin");DeleteFileW(bin.c_str());std::wstring converter=Join(Join(root,L"bin"),L"export2bin.exe");
+    if(Run(converter,L"/v \""+Utf8Wide(asset)+L".xmodel_export\"",outDir)!=0||GetFileAttributesW(bin.c_str())==INVALID_FILE_ATTRIBUTES){fail("export2bin failed; see BrushModeler.log beside the DLL.");break;}
+    std::string gdt;{std::ifstream r(Utf8Wide(gdtText),std::ios::binary);if(r)gdt.assign(std::istreambuf_iterator<char>(r),{});}if(gdt.empty()){fail("Could not read the selected GDT file.");break;}
+    g_buildPhase.store(4,std::memory_order_release);std::string entry="\n\t\""+asset+"\" ( \"xmodel.gdf\" )\n\t{\n\t\t\"BulletCollisionLOD\" \"None\"\n\t\t\"filename\" \""+gdtOutputPath+"\\\\"+asset+".xmodel_bin\"\n\t\t\"type\" \"rigid\"\n\t}\n";std::regex oldEntry("\""+asset+"\"\\s*\\(\\s*\"xmodel\\.gdf\"\\s*\\)\\s*\\{[^}]*\\}",std::regex::icase);gdt=std::regex_replace(gdt,oldEntry,"");size_t end=gdt.rfind('}');if(end==std::string::npos){fail("Selected GDT file has invalid brace structure.");break;}gdt.insert(end,entry);{std::ofstream w(Utf8Wide(gdtText),std::ios::binary|std::ios::trunc);w<<gdt;if(!w){fail("Could not update the selected GDT.");break;}}
+    if(Run(Join(Join(root,L"gdtdb"),L"gdtdb.exe"),L"/update",root)!=0){fail("Model built and GDT updated, but gdtdb /update failed. See log.");break;}
+    g_buildPhase.store(5,std::memory_order_release);char mapbuf[1024]{};snprintf(mapbuf,sizeof mapbuf,"{\n\"classname\" \"worldspawn\"\n}\n{\n\"classname\" \"misc_model\"\n\"model\" \"%s\"\n\"origin\" \"%.3f %.3f %.3f\"\n}\n",asset.c_str(),centerArray[0],centerArray[1],centerArray[2]);map=mapbuf;FileLog("background asset build completed: asset=%s merged_models=%zu source_brushes=%zu",asset.c_str(),queued.size(),brushGuids.size());
+   }while(false);
+   {std::lock_guard<std::mutex> lock(g_buildMutex);g_buildError=error;g_buildMap=map;}g_buildWorkerDone.store(true,std::memory_order_release);
+  });
+  Status("Building the combined XModel in the background... Radiant remains responsive.");
+ }catch(...){Status("Unexpected error; see BrushModeler.log beside the DLL.");Log("unhandled exception in Convert");}
+}
+void OnUnload()
+{
+ g_lookupCancelRequested.store(true,std::memory_order_relaxed);
+ if(g_lookupThread.joinable())g_lookupThread.join();
+ if(g_buildThread.joinable())g_buildThread.join();
+}
+int OnLoad()
+{
+ if(!rp::InRadiant())return 1;
+ std::wstring dll=rp::PluginDir();g_log=Join(dll,L"BrushModeler.log");Log("=== BrushModeler 0.3.4 OnLoad ===");
+ if(!rp::host->ui)return 1;
+ const auto*u=rp::host->ui;auto root=u->Widget(nullptr);auto box=u->VBox(root);
+ u->LayoutMargins(box,7,6,7,6);u->LayoutSpacing(box,5);
+ auto title=u->Label("<b>Brush Modeler</b> <small>Brushes, patches and model merging</small>",root);u->SetMaximumHeight(title,26);u->BoxAddWidget(box,title,0);
+ g_status=u->Label("",root);u->SetWordWrap(g_status,1);u->SetMaximumHeight(g_status,54);
+ auto statusRow=u->HBox();u->LayoutSpacing(statusRow,5);u->BoxAddWidget(statusRow,g_status,1);
+ g_cancelLookup=u->PushButton("Cancel",root);u->SetToolTip(g_cancelLookup,"Stop searching for selected model sources.");u->SetVisible(g_cancelLookup,0);u->BoxAddWidget(statusRow,g_cancelLookup,0);u->BoxAddLayout(box,statusRow,0);
+ auto assetRow=u->HBox();u->LayoutSpacing(assetRow,6);auto assetLabel=u->Label("Asset",root);u->SetMinimumSize(assetLabel,48,20);u->SetMaximumWidth(assetLabel,48);u->BoxAddWidget(assetRow,assetLabel,0);g_asset=u->LineEdit("combined_selection",root);u->SetPlaceholder(g_asset,"Combined model name");u->BoxAddWidget(assetRow,g_asset,1);auto assetSpacer=u->Label("",root);u->SetMinimumSize(assetSpacer,68,24);u->SetMaximumWidth(assetSpacer,68);u->BoxAddWidget(assetRow,assetSpacer,0);u->BoxAddLayout(box,assetRow,0);
+ auto gdtRow=u->HBox();u->LayoutSpacing(gdtRow,6);auto gdtLabel=u->Label("GDT",root);u->SetMinimumSize(gdtLabel,48,20);u->SetMaximumWidth(gdtLabel,48);u->BoxAddWidget(gdtRow,gdtLabel,0);g_gdt=u->LineEdit(rp::ConfigGet("model","gdt","").c_str(),root);u->SetPlaceholder(g_gdt,"GDT file to update");u->SetToolTip(g_gdt,"Choose the GDT that will receive the generated XModel entry.");u->BoxAddWidget(gdtRow,g_gdt,1);auto browse=u->PushButton("Browse…",root);u->SetMinimumSize(browse,68,24);u->SetMaximumWidth(browse,68);u->SetToolTip(browse,"Choose a GDT file.");u->BoxAddWidget(gdtRow,browse,0);u->BoxAddLayout(box,gdtRow,0);
+ std::string outputDefault=rp::ConfigGet("model","output_dir","");if(outputDefault.empty())outputDefault=WideUtf8(Join(Join(GameRoot(),L"model_export"),L"_brush_modeler"));
+ auto outputRow=u->HBox();u->LayoutSpacing(outputRow,6);auto outputLabel=u->Label("Output",root);u->SetMinimumSize(outputLabel,48,20);u->SetMaximumWidth(outputLabel,48);u->BoxAddWidget(outputRow,outputLabel,0);g_outputDir=u->LineEdit(outputDefault.c_str(),root);u->SetPlaceholder(g_outputDir,"Model output folder");u->SetToolTip(g_outputDir,"Folder for generated .xmodel_export and .xmodel_bin files.");u->BoxAddWidget(outputRow,g_outputDir,1);auto outputBrowse=u->PushButton("Browse…",root);u->SetMinimumSize(outputBrowse,68,24);u->SetMaximumWidth(outputBrowse,68);u->SetToolTip(outputBrowse,"Choose an output folder.");u->BoxAddWidget(outputRow,outputBrowse,0);u->BoxAddLayout(box,outputRow,0);
+ auto actionRow=u->HBox();u->LayoutSpacing(actionRow,5);auto queue=u->PushButton("Queue models",root);u->SetToolTip(queue,"Queue selected Radiant model entities to merge into the output.");u->BoxAddWidget(actionRow,queue,1);auto convert=u->PushButton("Build combined model",root);u->SetToolTip(convert,"Build an XModel from selected brushes/patches and queued models.");u->BoxAddWidget(actionRow,convert,1);u->BoxAddLayout(box,actionRow,0);
+ g_modelStatus=u->Label("No models queued.",root);u->SetWordWrap(g_modelStatus,1);u->SetMaximumHeight(g_modelStatus,40);u->BoxAddWidget(box,g_modelStatus,0);
+ g_count=u->Label("Selection: checking…",root);u->SetWordWrap(g_count,1);u->SetMaximumHeight(g_count,28);u->BoxAddWidget(box,g_count,0);
+ Status("Ready: select brushes/patches or queue models, choose a GDT, then build.");
+ auto help=u->Label("Output: .xmodel_export + .xmodel_bin. Model placement is preserved; brush replacement can be undone.",root);u->SetWordWrap(help,1);u->SetMaximumHeight(help,36);u->BoxAddWidget(box,help,0);u->BoxAddStretch(box,1);
+ rp::host->OnClicked(rp::self,browse,OnBrowseGdt,nullptr);rp::host->OnClicked(rp::self,outputBrowse,OnBrowseOutput,nullptr);rp::host->OnClicked(rp::self,queue,OnQueueModel,nullptr);rp::host->OnClicked(rp::self,g_cancelLookup,OnCancelLookup,nullptr);rp::host->OnClicked(rp::self,convert,OnConvert,nullptr);
+ g_pane=rp::host->CreatePane(rp::self,"Brush to XModel",root,390,300);
+ if(g_pane&&rp::Has(&rp::host->TabPaneWith)&&rp::host->TabPaneWith){int docked=rp::host->TabPaneWith(rp::self,g_pane,"right:Camera");Log("pane right-of-camera placement result=%d",docked);}
+ auto menu=rp::host->AddMenu(rp::self,"Brush Modeler");if(menu&&g_pane)rp::host->AddMenuAction(rp::self,menu,rp::host->PaneToggleAction(rp::self,g_pane));rp::host->ShowPane(rp::self,g_pane,1);Log("pane created=%d log=%s",g_pane!=nullptr,WideUtf8(g_log).c_str());return 1;
+}
+ void OnTick(){
+ if(g_lookupRunning){if(g_lookupDone.load(std::memory_order_acquire))FinishModelLookup();else if(GetTickCount64()-g_lookupBannerAt>=1000){unsigned long sec=(unsigned long)((GetTickCount64()-g_lookupStartedAt)/1000);char lookupBanner[192];if(g_lookupCancelRequested.load(std::memory_order_relaxed))snprintf(lookupBanner,sizeof lookupBanner,"Cancelling model search… (%lu:%02lu elapsed)",sec/60,sec%60);else snprintf(lookupBanner,sizeof lookupBanner,"Searching model GDTs… (%lu:%02lu elapsed)",sec/60,sec%60);Status(lookupBanner,false);g_lookupBannerAt=GetTickCount64();}}
+ if(g_buildRunning){int phase=g_buildPhase.load(std::memory_order_acquire);ULONGLONG tickNow=GetTickCount64();if(phase!=g_phaseShown||tickNow-g_bannerUpdatedAt>=1000){const char*msg="Building the XModel";switch(phase){case 1:msg="Converting selected brush and patch geometry";break;case 2:msg="Preparing selected models for merging";break;case 3:msg="Compiling the XModel";break;case 4:msg="Registering the model in its GDT";break;case 5:msg="Updating the Radiant asset database";break;case 6:msg="Radiant is adding the model and replacing selected geometry";break;}unsigned long sec=g_buildStartedAt?(unsigned long)((tickNow-g_buildStartedAt)/1000):0;char banner[256];snprintf(banner,sizeof banner,"%s… (%lu:%02lu elapsed)",msg,sec/60,sec%60);Status(banner,false);g_phaseShown=phase;g_bannerUpdatedAt=tickNow;}FinishBuild();if(g_buildRunning)return;}
+ ULONGLONG now=GetTickCount64();if(g_waitingRadiantRefresh){if(now<g_refreshReadyAt)return;g_waitingRadiantRefresh=false;g_phaseShown=-1;}
+ static uint64_t lastHash=0;static ULONGLONG polled=0;if(now-polled<1000)return;polled=now;if(g_pane&&rp::host->PaneVisible&&!rp::host->PaneVisible(rp::self,g_pane))return;if(rp::host->IsReloading&&rp::host->IsReloading(rp::self))return;auto s=Selection();uint64_t hash=1469598103934665603ull;size_t brushCount=0;for(const auto&b:s){for(const unsigned char*c=(const unsigned char*)b.brushGuid;*c;++c){hash^=*c;hash*=1099511628211ull;}hash^=0xff;hash*=1099511628211ull;for(const unsigned char*c=(const unsigned char*)b.entityGuid;*c;++c){hash^=*c;hash*=1099511628211ull;}hash^=0xfe;hash*=1099511628211ull;if(b.brushGuid[0]&&(!std::any_of(g_queuedModels.begin(),g_queuedModels.end(),[&](const QueuedModel&m){return m.guid==b.entityGuid;})))++brushCount;}if(hash!=lastHash){lastHash=hash;char b[128];snprintf(b,sizeof b,"Selection: %zu item(s), %zu brush/patch item(s)",s.size(),brushCount);if(g_count&&rp::host->ui)rp::host->ui->SetLabelText(g_count,b);Log("selection changed: items=%zu brushes_and_patches=%zu signature=%016llx",s.size(),brushCount,(unsigned long long)hash);if(!g_buildRunning&&!g_lookupRunning&&!g_waitingRadiantRefresh){if(brushCount){char ready[128];snprintf(ready,sizeof ready,"Ready to convert: %zu brush/patch item(s) selected.",brushCount);Status(ready);}else if(!g_queuedModels.empty()){std::string queued="Ready to combine "+std::to_string(g_queuedModels.size())+" queued model(s).";Status(queued);}
+ else Status("Ready: select brushes/patches or queue models, then build.");}}
+}void OnSettings(){if(g_pane)rp::host->ShowPane(rp::self,g_pane,1);}
+}
+extern "C" MODTOOLS_PLUGIN_EXPORT const ModToolsPluginApi* ModToolsPluginEntry(ModToolsPlugin*self,const ModToolsHostApi*host){rp::Bind(self,host);static ModToolsPluginApi a{};a.size=sizeof a;a.apiVersion=MODTOOLS_PLUGIN_API_VERSION;a.name="BrushModeler";a.displayName="Brush Modeler";a.version="0.3.4";a.author="Owen";a.description="Convert selected Radiant brushes and merge selected BO3 models into an XModel.";a.apps=MODTOOLS_APP_RADIANT;a.OnLoad=OnLoad;a.OnUnload=OnUnload;a.OnTick=OnTick;a.OnSettings=OnSettings;return &a;}

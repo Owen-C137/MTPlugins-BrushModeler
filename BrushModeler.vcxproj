@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup Label="UserSettings">
+    <PluginName>BrushModeler</PluginName>
+    <Bo3Root Condition="'$(Bo3Root)'=='' and '$(BO3_ROOT)'!=''">$(BO3_ROOT)</Bo3Root>
+    <ModToolsSdkDir Condition="'$(ModToolsSdkDir)'==''">$(MSBuildThisFileDirectory)sdk</ModToolsSdkDir>
+    <DeployToGame>false</DeployToGame>
+  </PropertyGroup>
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64"><Configuration>Debug</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals"><VCProjectVersion>17.0</VCProjectVersion><Keyword>Win32Proj</Keyword><ProjectGuid>{8DCCCE9A-4AD5-4FD8-9D25-72FAFBE78301}</ProjectGuid><RootNamespace>BrushModeler</RootNamespace><ProjectName>BrushModeler</ProjectName></PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration"><ConfigurationType>DynamicLibrary</ConfigurationType><UseDebugLibraries>true</UseDebugLibraries><PlatformToolset>$(DefaultPlatformToolset)</PlatformToolset><CharacterSet>Unicode</CharacterSet></PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration"><ConfigurationType>DynamicLibrary</ConfigurationType><UseDebugLibraries>false</UseDebugLibraries><PlatformToolset>$(DefaultPlatformToolset)</PlatformToolset><WholeProgramOptimization>false</WholeProgramOptimization><CharacterSet>Unicode</CharacterSet></PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup><OutDir>$(MSBuildThisFileDirectory)bin\$(Configuration)\</OutDir><IntDir>$(MSBuildThisFileDirectory)obj\$(Configuration)\</IntDir><TargetName>BrushModeler</TargetName><DeployDir>$(Bo3Root)\bin\plugins\BrushModeler\</DeployDir><LocalDebuggerCommand>$(Bo3Root)\bin\Radiant_modtools.exe</LocalDebuggerCommand><LocalDebuggerWorkingDirectory>$(Bo3Root)\bin\</LocalDebuggerWorkingDirectory><DebuggerFlavor>WindowsLocalDebugger</DebuggerFlavor></PropertyGroup>
+  <ItemDefinitionGroup><ClCompile><WarningLevel>Level3</WarningLevel><SDLCheck>true</SDLCheck><ConformanceMode>true</ConformanceMode><LanguageStandard>stdcpp17</LanguageStandard><PrecompiledHeader>NotUsing</PrecompiledHeader><PreprocessorDefinitions>_WINDOWS;_USRDLL;WIN32_LEAN_AND_MEAN;NOMINMAX;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions><AdditionalIncludeDirectories>$(ProjectDir);$(ModToolsSdkDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories><DisableSpecificWarnings>4996;%(DisableSpecificWarnings)</DisableSpecificWarnings></ClCompile><Link><SubSystem>Windows</SubSystem><GenerateDebugInformation>true</GenerateDebugInformation><AdditionalDependencies>user32.lib;comdlg32.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies></Link></ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'"><ClCompile><PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions><RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary></ClCompile></ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'"><ClCompile><FunctionLevelLinking>true</FunctionLevelLinking><IntrinsicFunctions>true</IntrinsicFunctions><DebugInformationFormat>None</DebugInformationFormat><PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions><RuntimeLibrary>MultiThreaded</RuntimeLibrary></ClCompile><Link><GenerateDebugInformation>false</GenerateDebugInformation><EnableCOMDATFolding>true</EnableCOMDATFolding><OptimizeReferences>true</OptimizeReferences></Link></ItemDefinitionGroup>
+  <ItemGroup><ClCompile Include="BrushModeler.cpp" /></ItemGroup>
+  <ItemGroup><ClInclude Include="$(ModToolsSdkDir)\modtools_plugin.h" /><ClInclude Include="$(ModToolsSdkDir)\modtools_plugin.hpp" /></ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="CheckSdk" BeforeTargets="ClCompile"><Error Condition="!Exists('$(ModToolsSdkDir)\modtools_plugin.h')" Text="ModTools SDK header not found." /></Target>
+  <Target Name="DeployPlugin" AfterTargets="Build" Condition="'$(DeployToGame)'=='true'"><MakeDir Directories="$(DeployDir);$(DeployDir)Tools" /><Copy SourceFiles="$(TargetPath)" DestinationFolder="$(DeployDir)" Retries="0" /><Copy Condition="Exists('$(OutDir)$(TargetName).pdb')" SourceFiles="$(OutDir)$(TargetName).pdb" DestinationFolder="$(DeployDir)" Retries="0" /><Copy SourceFiles="$(MSBuildThisFileDirectory)BrushModeler.ini;$(MSBuildThisFileDirectory)merge_xmodels.exe;$(MSBuildThisFileDirectory)merge_xmodels.py;$(MSBuildThisFileDirectory)README.md;$(MSBuildThisFileDirectory)THIRD_PARTY_NOTICES.md" DestinationFolder="$(DeployDir)" Retries="0" /><Copy SourceFiles="$(MSBuildThisFileDirectory)Tools\exportx.exe" DestinationFolder="$(DeployDir)Tools" Retries="0" /></Target>
+</Project>
