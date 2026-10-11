@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.3.4",
+    [string]$Version = "0.3.5",
     [string]$Bo3Root = "D:\SteamLibrary\steamapps\common\Call of Duty Black Ops III",
     [string]$Python = "python"
 )
