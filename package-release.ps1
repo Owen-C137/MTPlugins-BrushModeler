@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.3.5",
+    [string]$Version = "0.3.10",
     [string]$Bo3Root = "D:\SteamLibrary\steamapps\common\Call of Duty Black Ops III",
     [string]$Python = "python"
 )
@@ -34,6 +34,7 @@ $releaseFiles = @(
     @{ Source=(Join-Path $plugin "BrushModeler.ini"); Relative="BrushModeler.ini" },
     @{ Source=(Join-Path $plugin "merge_xmodels.exe"); Relative="merge_xmodels.exe" },
     @{ Source=(Join-Path $plugin "README.md"); Relative="README.md" },
+    @{ Source=(Join-Path $plugin "CHANGELOG.md"); Relative="CHANGELOG.md" },
     @{ Source=(Join-Path $plugin "THIRD_PARTY_NOTICES.md"); Relative="THIRD_PARTY_NOTICES.md" },
     @{ Source=(Join-Path $plugin "Tools\exportx.exe"); Relative="Tools\exportx.exe" }
 )
@@ -56,7 +57,7 @@ $indexEntry = [ordered]@{
     author = "Owen"
     version = $Version
     description = "Convert selected Radiant brushes and patches to XModels, and merge selected BO3 models."
-    changes = "Keeps the Radiant pane compact at full height and aligns all input rows."
+    changes = "Uses database-only model lookup, preserves merged model transforms and derived materials, and improves model merge diagnostics."
     apps = @("radiant")
     apiVersion = 1
     files = $files

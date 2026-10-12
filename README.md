@@ -10,7 +10,9 @@ Install the complete `BrushModeler` folder into the Mod Tools plugin directory:
 
 The folder must include `BrushModeler.dll`, `BrushModeler.ini`, `merge_xmodels.exe`, and `Tools\exportx.exe`. The plugin also writes `BrushModeler.log` beside the DLL when it runs.
 
-No separate Python installation or Castline installation is required. ExportX and the merge helper are bundled with the add-on. The existing BO3 Mod Tools executables `export2bin.exe` and `gdtdb.exe` are still used to compile/register the generated asset.
+No separate Python or Castline installation is required. ExportX and the merge helper are bundled with the add-on. Model lookup uses BO3's `gdtdb/gdt.db` to find the source GDT, then reads the corresponding GDT entry. Make sure the model is loaded in APE so it is present in the asset database. The existing BO3 Mod Tools executables `export2bin.exe` and `gdtdb.exe` are still used to compile/register the generated asset.
+
+Set `cleanExports=false` under `[model]` in `BrushModeler.ini` to retain generated `.xmodel_export` files and staged `queued_source_*.xmodel_bin` files. It defaults to `true`, which removes these generated intermediates after a successful build; failed builds keep them for debugging.
 
 ## Build / distribution
 

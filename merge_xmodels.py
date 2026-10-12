@@ -2,7 +2,16 @@
 import math
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
+
+def log_event(message):
+    try:
+        stamp = datetime.now().astimezone().isoformat(timespec="milliseconds")
+        with Path(sys.argv[0]).resolve().with_name("BrushModeler.log").open("a", encoding="utf-8") as log:
+            log.write(f"{stamp} [merge-helper] {message}\n")
+    except OSError:
+        pass
 
 
 def read(path):
@@ -82,7 +91,18 @@ def shifted(doc, bone_at, vert_at, face_at, object_at, material_at, transform=No
         # XMODEL_EXPORT supports one hierarchy root. Attach each appended model's
         # former root to the combined tag_origin instead of emitting another -1 parent.
         merged_parent = parent + bone_at if parent >= 0 else (0 if bone_at > 0 else -1)
-        bones.append(f"BONE {idx} {merged_parent} {m[3]}")
+        bone_name = m[3]
+        if bone_at > 0 and transform:
+            # Repeated instances often share identical skeleton bone names. Keep
+            # each appended instance's skeleton independent when export2bin builds
+            # the combined model, so one instance's bind pose cannot override another.
+            suffix = f"__bm{bone_at}"
+            if bone_name.startswith('"') and bone_name.endswith('"'):
+                raw_name = bone_name[1:-1]
+                bone_name = f'"{raw_name[:max(0, 63-len(suffix))]}{suffix}"'
+            else:
+                bone_name = f'"{bone_name[:max(0, 63-len(suffix))]}{suffix}"'
+        bones.append(f"BONE {idx} {merged_parent} {bone_name}")
     bone_data = []
     for chunk in doc["bone_data"]:
         out = []
@@ -206,7 +226,8 @@ def optimize_mesh(d):
     d["faces"] = kept_faces
     return {"vertices_before": old_vertex_count, "vertices_after": len(unique),
             "faces_before": old_face_count, "faces_after": len(kept_faces),
-            "degenerate_faces_removed": degenerate, "duplicate_faces_removed": duplicate}
+            "degenerate_faces_removed": degenerate, "duplicate_faces_removed": duplicate,
+            "vertex_offset_bounds": vertex_offset_bounds(d)}
 
 
 def write(path, a, b):
@@ -244,6 +265,56 @@ def single_root(doc):
     return True
 
 
+def static_identity_skeleton(doc):
+    """Return true for multi-bone exports that are really static mesh groups.
+
+    Some prop exports split geometry across several independent bones but give
+    every bone an identity bind transform and every vertex one full-weight bone.
+    Their placement can be baked into vertices without changing the visible mesh.
+    """
+    if len(doc["bones"]) <= 1 or len(doc["bone_data"]) != len(doc["bones"]):
+        return False
+    expected = {
+        "OFFSET": (0.0, 0.0, 0.0),
+        "X": (1.0, 0.0, 0.0),
+        "Y": (0.0, 1.0, 0.0),
+        "Z": (0.0, 0.0, 1.0),
+    }
+    for chunk in doc["bone_data"]:
+        vectors = {}
+        for line in chunk:
+            parts = line.split()
+            if parts and parts[0] in expected:
+                try:
+                    vectors[parts[0]] = tuple(float(value.strip(",")) for value in parts[1:4])
+                except ValueError:
+                    return False
+        # ExportX omits SCALE when it is the default identity scale.
+        vectors.setdefault("SCALE", (1.0, 1.0, 1.0))
+        if any(key not in vectors or len(vectors[key]) != 3 or
+               any(abs(actual - target) > 1e-6 for actual, target in zip(vectors[key], target_values))
+               for key, target_values in expected.items()):
+            return False
+    for chunk in doc["verts"]:
+        bone_count = None
+        weights = []
+        for line in chunk[1:]:
+            parts = line.split()
+            if parts and parts[0] == "BONES" and len(parts) >= 2:
+                try:
+                    bone_count = int(parts[1])
+                except ValueError:
+                    return False
+            elif parts and parts[0] == "BONE" and len(parts) >= 3:
+                try:
+                    weights.append((int(parts[1]), float(parts[2].strip(","))))
+                except ValueError:
+                    return False
+        if bone_count != 1 or len(weights) != 1 or not 0 <= weights[0][0] < len(doc["bones"]) or abs(weights[0][1] - 1.0) > 1e-6:
+            return False
+    return bool(doc["verts"])
+
+
 def root_vectors(doc):
     values = {}
     for line in doc["bone_data"][0]:
@@ -252,6 +323,51 @@ def root_vectors(doc):
             values[parts[0]] = tuple(float(v.strip(",")) for v in parts[1:4])
     return {"OFFSET": values.get("OFFSET", (0, 0, 0)), "SCALE": values.get("SCALE", (1, 1, 1)),
             "X": values.get("X", (1, 0, 0)), "Y": values.get("Y", (0, 1, 0)), "Z": values.get("Z", (0, 0, 1))}
+
+
+def vertex_offset_bounds(doc):
+    points = []
+    for chunk in doc["verts"]:
+        for line in chunk:
+            if line.startswith("OFFSET "):
+                values = tuple(float(value.strip(",")) for value in line.split()[1:4])
+                if len(values) == 3:
+                    points.append(values)
+                break
+    if not points:
+        return None
+    return (tuple(min(p[i] for p in points) for i in range(3)),
+            tuple(max(p[i] for p in points) for i in range(3)))
+
+
+def bone_offset_bounds(doc):
+    points = []
+    for chunk in doc["bone_data"]:
+        for line in chunk:
+            if line.startswith("OFFSET "):
+                values = tuple(float(value.strip(",")) for value in line.split()[1:4])
+                if len(values) == 3:
+                    points.append(values)
+                break
+    if not points:
+        return None
+    return (tuple(min(p[i] for p in points) for i in range(3)),
+            tuple(max(p[i] for p in points) for i in range(3)))
+
+
+def format_bounds(bounds):
+    if not bounds:
+        return "unavailable"
+    lo, hi = bounds
+    return f"min=({lo[0]:.3f},{lo[1]:.3f},{lo[2]:.3f}) max=({hi[0]:.3f},{hi[1]:.3f},{hi[2]:.3f})"
+
+
+def format_root(doc):
+    if not doc["bone_data"]:
+        return "unavailable"
+    root = root_vectors(doc)
+    return "OFFSET=%s SCALE=%s X=%s Y=%s Z=%s" % tuple(
+        ",".join(f"{v:.4f}" for v in root[key]) for key in ("OFFSET", "SCALE", "X", "Y", "Z"))
 
 
 def shifted_baked_single_root(doc, vert_at, face_at, object_at, material_at, transform):
@@ -332,8 +448,7 @@ def main():
         path = sys.argv[2]
         doc, _ = sections(read(path))
         cleanup = write(path, doc, {key: [] for key in doc})
-        with Path(__file__).with_name("BrushModeler.log").open("a", encoding="utf-8") as log:
-            log.write(f"mesh cleanup: vertices={cleanup['vertices_before']}->{cleanup['vertices_after']} faces={cleanup['faces_before']}->{cleanup['faces_after']} degenerate_removed={cleanup['degenerate_faces_removed']} exact_duplicates_removed={cleanup['duplicate_faces_removed']} mode=brush_patch_only\n")
+        log_event(f"mesh cleanup: vertices={cleanup['vertices_before']}->{cleanup['vertices_after']} faces={cleanup['faces_before']}->{cleanup['faces_after']} degenerate_removed={cleanup['degenerate_faces_removed']} exact_duplicates_removed={cleanup['duplicate_faces_removed']} mode=brush_patch_only bounds={format_bounds(cleanup['vertex_offset_bounds'])}")
         return
     allow_empty = len(sys.argv) == 13 and sys.argv[12] == "--allow-empty-base"
     if len(sys.argv) not in (12, 13) or (len(sys.argv) == 13 and not allow_empty):
@@ -352,19 +467,28 @@ def main():
         q = (x, y, z); out = tuple(sum(rot[i][j]*q[j] for j in range(3)) for i in range(3))
         if is_offset: out = (out[0]+ox-cx, out[1]+oy-cy, out[2]+oz-cz)
         return out
+    source_bounds = vertex_offset_bounds(b)
+    source_root = format_root(b)
     if single_root(b):
         # A second tag_origin bone's offset is not applied consistently by Radiant
         # after export2bin. Bake the entity-relative position into the static model
         # vertices and bind them to the brush model's existing root instead.
         bb = shifted_baked_single_root(b, len(a["verts"]), len(a["faces"]), len(a["objects"]), len(a["materials"]), transform)
         strategy = "baked_to_shared_root"
+    elif static_identity_skeleton(b):
+        # Some static props split mesh groups across independent identity bones.
+        # export2bin/Radiant does not reliably preserve per-instance placement for
+        # these appended skeletons, so bake each instance into the shared root.
+        bb = shifted_baked_single_root(b, len(a["verts"]), len(a["faces"]), len(a["objects"]), len(a["materials"]), transform)
+        strategy = "baked_static_identity_skeleton"
     else:
         bb = shifted(b, len(a["bones"]), len(a["verts"]), len(a["faces"]), len(a["objects"]), len(a["materials"]), transform)
         strategy = "attached_source_skeleton"
+    transformed_bounds = vertex_offset_bounds(bb)
     cleanup = write(sys.argv[1], aa, bb)
-    with Path(__file__).with_name("BrushModeler.log").open("a", encoding="utf-8") as log:
-        log.write(f"mesh cleanup: vertices={cleanup['vertices_before']}->{cleanup['vertices_after']} faces={cleanup['faces_before']}->{cleanup['faces_after']} degenerate_removed={cleanup['degenerate_faces_removed']} exact_duplicates_removed={cleanup['duplicate_faces_removed']}\n")
-        log.write(f"merge complete: strategy={strategy} source_bones={len(b['bones'])} source_vertices={len(b['verts'])} origin=({ox:.3f},{oy:.3f},{oz:.3f}) output_origin=({cx:.3f},{cy:.3f},{cz:.3f}) offset=({ox-cx:.3f},{oy-cy:.3f},{oz-cz:.3f}) angles=({pitch:.3f},{yaw:.3f},{roll:.3f})\n")
+    log_event(f"model transform audit: source_export={Path(sys.argv[2]).name} strategy={strategy} source_bones={len(b['bones'])} source_vertices={len(b['verts'])} source_faces={len(b['faces'])} source_vertex_offset_bounds={format_bounds(source_bounds)} source_root={source_root} entity_origin=({ox:.6f},{oy:.6f},{oz:.6f}) combined_origin=({cx:.6f},{cy:.6f},{cz:.6f}) translation=({ox-cx:.6f},{oy-cy:.6f},{oz-cz:.6f}) angles_pitch_yaw_roll=({pitch:.6f},{yaw:.6f},{roll:.6f}) transformed_vertex_offset_bounds={format_bounds(transformed_bounds)} transformed_bind_bone_offset_bounds={format_bounds(bone_offset_bounds(bb))}")
+    log_event(f"mesh cleanup: vertices={cleanup['vertices_before']}->{cleanup['vertices_after']} faces={cleanup['faces_before']}->{cleanup['faces_after']} degenerate_removed={cleanup['degenerate_faces_removed']} exact_duplicates_removed={cleanup['duplicate_faces_removed']}")
+    log_event(f"combined export bounds: vertices={cleanup['vertices_after']} faces={cleanup['faces_after']} vertex_offset_bounds={format_bounds(cleanup['vertex_offset_bounds'])}")
 
 
 if __name__ == "__main__":
@@ -373,10 +497,5 @@ if __name__ == "__main__":
     except Exception as exc:
         # The plugin launches Python without a console. Put the actionable exception in
         # the same log the user already collects for support.
-        log_path = Path(__file__).with_name("BrushModeler.log")
-        try:
-            with log_path.open("a", encoding="utf-8") as log:
-                log.write(f"merge script failed: {type(exc).__name__}: {exc}\n")
-        except OSError:
-            pass
+        log_event(f"merge script failed: {type(exc).__name__}: {exc}")
         raise
