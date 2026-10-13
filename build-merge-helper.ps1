@@ -1,7 +1,13 @@
-param([string]$Python = "python")
+param([string]$Python = "")
 $ErrorActionPreference = "Stop"
 $plugin = Split-Path -Parent $MyInvocation.MyCommand.Path
-$repo = Resolve-Path (Join-Path $plugin "..\..")
+if ([string]::IsNullOrWhiteSpace($Python)) {
+    $localPython = Join-Path $plugin "build\python\python.exe"
+    $Python = if (Test-Path -LiteralPath $localPython) { $localPython } else { "python" }
+}
+$repo = $plugin
+$monorepo = Join-Path $plugin "..\.."
+if (Test-Path -LiteralPath (Join-Path $monorepo "RadiantPlugins.sln")) { $repo = (Resolve-Path $monorepo).Path }
 $dist = Join-Path $plugin "build\dist"
 $work = Join-Path $plugin "build\work"
 $spec = Join-Path $plugin "build"

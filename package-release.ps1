@@ -1,17 +1,24 @@
 param(
-    [string]$Version = "0.3.10",
+    [string]$Version = "0.3.11",
     [string]$Bo3Root = "D:\SteamLibrary\steamapps\common\Call of Duty Black Ops III",
-    [string]$Python = "python"
+    [string]$Python = ""
 )
 $ErrorActionPreference = "Stop"
 if ($Version -notmatch '^\d+(\.\d+)*$') { throw "Version must contain only numbers and dots." }
 $plugin = Split-Path -Parent $MyInvocation.MyCommand.Path
-$repo = Resolve-Path (Join-Path $plugin "..\..")
+$repo = $plugin
+$monorepo = Join-Path $plugin "..\.."
+if (Test-Path -LiteralPath (Join-Path $monorepo "RadiantPlugins.sln")) { $repo = (Resolve-Path $monorepo).Path }
+if ([string]::IsNullOrWhiteSpace($Python)) {
+    $localPython = Join-Path $plugin "build\python\python.exe"
+    $Python = if (Test-Path -LiteralPath $localPython) { $localPython } else { "python" }
+}
 $distRoot = Join-Path $repo "dist"
 $out = Join-Path $distRoot "BrushModeler-$Version"
 $candidate = Join-Path $out "BrushModeler"
 $indexFiles = Join-Path $out "index-files\plugins\BrushModeler\$Version"
 $msbuild = @(
+    "C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe",
     "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\MSBuild\Current\Bin\MSBuild.exe",
     "C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe"
 ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
@@ -57,7 +64,7 @@ $indexEntry = [ordered]@{
     author = "Owen"
     version = $Version
     description = "Convert selected Radiant brushes and patches to XModels, and merge selected BO3 models."
-    changes = "Uses database-only model lookup, preserves merged model transforms and derived materials, and improves model merge diagnostics."
+    changes = "Merges queued models in one pass to avoid repeated reprocessing as the selection grows."
     apps = @("radiant")
     apiVersion = 1
     files = $files

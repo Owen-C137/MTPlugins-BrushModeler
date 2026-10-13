@@ -1,5 +1,6 @@
 """Merge two BO3 XMODEL_EXPORT v6 files by offsetting their indexed sections."""
 import math
+import json
 import re
 import sys
 from datetime import datetime
@@ -449,6 +450,49 @@ def main():
         doc, _ = sections(read(path))
         cleanup = write(path, doc, {key: [] for key in doc})
         log_event(f"mesh cleanup: vertices={cleanup['vertices_before']}->{cleanup['vertices_after']} faces={cleanup['faces_before']}->{cleanup['faces_after']} degenerate_removed={cleanup['degenerate_faces_removed']} exact_duplicates_removed={cleanup['duplicate_faces_removed']} mode=brush_patch_only bounds={format_bounds(cleanup['vertex_offset_bounds'])}")
+        return
+    if len(sys.argv) in (4, 5) and sys.argv[1] == "--merge-many":
+        base_path, manifest_path = sys.argv[2:4]
+        allow_empty = len(sys.argv) == 5 and sys.argv[4] == "--allow-empty-base"
+        if len(sys.argv) == 5 and not allow_empty:
+            raise SystemExit("usage: merge_xmodels.py --merge-many base_export manifest.json [--allow-empty-base]")
+        base, _ = sections(read(base_path), allow_empty=allow_empty)
+        combined = shifted(base, 0, 0, 0, 0, 0)
+        with open(manifest_path, "r", encoding="utf-8") as manifest_file:
+            models = json.load(manifest_file)
+        for item in models:
+            model_path = item["export"]
+            b, _ = sections(read(model_path))
+            ox, oy, oz = map(float, item["origin"])
+            cx, cy, cz = map(float, item["center"])
+            pitch, yaw, roll = map(float, item["angles"])
+            p, y, r = map(math.radians, (pitch, yaw, roll))
+            cp, sp, cyaw, syaw, cr, sr = math.cos(p), math.sin(p), math.cos(y), math.sin(y), math.cos(r), math.sin(r)
+            rot = ((cyaw*cp, cyaw*sp*sr-syaw*cr, cyaw*sp*cr+syaw*sr),
+                   (syaw*cp, syaw*sp*sr+cyaw*cr, syaw*sp*cr-cyaw*sr),
+                   (-sp, cp*sr, cp*cr))
+            def transform(x, y, z, is_offset):
+                q = (x, y, z); out = tuple(sum(rot[i][j]*q[j] for j in range(3)) for i in range(3))
+                if is_offset: out = (out[0]+ox-cx, out[1]+oy-cy, out[2]+oz-cz)
+                return out
+            source_bounds = vertex_offset_bounds(b)
+            source_root = format_root(b)
+            if single_root(b):
+                bb = shifted_baked_single_root(b, len(combined["verts"]), len(combined["faces"]), len(combined["objects"]), len(combined["materials"]), transform)
+                strategy = "baked_to_shared_root"
+            elif static_identity_skeleton(b):
+                bb = shifted_baked_single_root(b, len(combined["verts"]), len(combined["faces"]), len(combined["objects"]), len(combined["materials"]), transform)
+                strategy = "baked_static_identity_skeleton"
+            else:
+                bb = shifted(b, len(combined["bones"]), len(combined["verts"]), len(combined["faces"]), len(combined["objects"]), len(combined["materials"]), transform)
+                strategy = "attached_source_skeleton"
+            transformed_bounds = vertex_offset_bounds(bb)
+            for key in combined:
+                combined[key].extend(bb[key])
+            log_event(f"model transform audit: source_export={Path(model_path).name} strategy={strategy} source_bones={len(b['bones'])} source_vertices={len(b['verts'])} source_faces={len(b['faces'])} source_vertex_offset_bounds={format_bounds(source_bounds)} source_root={source_root} entity_origin=({ox:.6f},{oy:.6f},{oz:.6f}) combined_origin=({cx:.6f},{cy:.6f},{cz:.6f}) translation=({ox-cx:.6f},{oy-cy:.6f},{oz-cz:.6f}) angles_pitch_yaw_roll=({pitch:.6f},{yaw:.6f},{roll:.6f}) transformed_vertex_offset_bounds={format_bounds(transformed_bounds)} transformed_bind_bone_offset_bounds={format_bounds(bone_offset_bounds(bb))}")
+        cleanup = write(base_path, combined, {key: [] for key in combined})
+        log_event(f"mesh cleanup: vertices={cleanup['vertices_before']}->{cleanup['vertices_after']} faces={cleanup['faces_before']}->{cleanup['faces_after']} degenerate_removed={cleanup['degenerate_faces_removed']} exact_duplicates_removed={cleanup['duplicate_faces_removed']} mode=batch_merge")
+        log_event(f"combined export bounds: vertices={cleanup['vertices_after']} faces={cleanup['faces_after']} vertex_offset_bounds={format_bounds(cleanup['vertex_offset_bounds'])}")
         return
     allow_empty = len(sys.argv) == 13 and sys.argv[12] == "--allow-empty-base"
     if len(sys.argv) not in (12, 13) or (len(sys.argv) == 13 and not allow_empty):

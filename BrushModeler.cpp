@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <fstream>
 #include <filesystem>
+#include <locale>
 #include <atomic>
 #include <mutex>
 #include <regex>
@@ -289,28 +290,29 @@ void OnConvert(void*)
   g_buildThread=std::thread([root,outDir,exp,baseExp,asset,gdtText,queued=std::move(queued),brushGuids,pluginDir,centerArray,gdtOutputPath,cleanExports]()mutable{
    std::string error,map;auto fail=[&](const std::string&m){error=m;};
    do{
-    std::wstring workingExport=baseExp;std::wstring exportx=Join(Join(pluginDir,L"Tools"),L"exportx.exe"),mergeTool=Join(pluginDir,L"merge_xmodels.exe");
+    std::wstring exportx=Join(Join(pluginDir,L"Tools"),L"exportx.exe"),mergeTool=Join(pluginDir,L"merge_xmodels.exe"),modelManifest=Join(outDir,L"queued_models.json");
     if(GetFileAttributesW(mergeTool.c_str())==INVALID_FILE_ATTRIBUTES){fail("Brush Modeler merge helper is missing. Reinstall the plugin folder.");FileLog("merge helper missing path=%s",WideUtf8(mergeTool).c_str());break;}
     if(!queued.empty()&&GetFileAttributesW(exportx.c_str())==INVALID_FILE_ATTRIBUTES){fail("Brush Modeler could not find its bundled ExportX tool. Reinstall the plugin folder.");FileLog("bundled ExportX missing path=%s",WideUtf8(exportx).c_str());break;}
+    std::ofstream manifest;if(!queued.empty()){manifest.open(modelManifest,std::ios::binary|std::ios::trunc);manifest.imbue(std::locale::classic());if(!manifest){fail("Could not create the temporary model merge manifest.");FileLog("could not create merge manifest path=%s",WideUtf8(modelManifest).c_str());break;}manifest<<"[\n";}
     for(size_t i=0;i<queued.size();++i){const auto&m=queued[i];g_buildPhase.store(2,std::memory_order_release);FileLog("model transform dispatch index=%zu guid=%s asset=%s bin=%s source_origin=%.6f %.6f %.6f output_origin=%.6f %.6f %.6f translation=%.6f %.6f %.6f angles_pitch_yaw_roll=%.6f %.6f %.6f",i,m.guid.c_str(),m.asset.c_str(),WideUtf8(m.bin).c_str(),m.origin[0],m.origin[1],m.origin[2],centerArray[0],centerArray[1],centerArray[2],m.origin[0]-centerArray[0],m.origin[1]-centerArray[1],m.origin[2]-centerArray[2],m.angles[0],m.angles[1],m.angles[2]);
       std::wstring suffix=std::to_wstring(i);std::wstring sourceBin=Join(outDir,L"queued_source_"+suffix+L".xmodel_bin"),sourceExp=Join(outDir,L"queued_source_"+suffix+L".xmodel_export"),mergeSourceExp=sourceExp+L".skin_override.xmodel_export";DeleteFileW(sourceBin.c_str());DeleteFileW(sourceExp.c_str());DeleteFileW(mergeSourceExp.c_str());
      if(!CopyFileW(m.bin.c_str(),sourceBin.c_str(),FALSE)){fail("Could not stage selected model "+m.asset+". See BrushModeler.log.");FileLog("model staging copy failed asset=%s error=%lu",m.asset.c_str(),GetLastError());break;}
      std::wstring exportArgs=L"-f \""+sourceBin.substr(sourceBin.find_last_of(L"\\/")+1)+L"\" -m export";
       if(Run(exportx,exportArgs,outDir)!=0||GetFileAttributesW(sourceExp.c_str())==INVALID_FILE_ATTRIBUTES){fail("ExportX could not export selected model "+m.asset+". See BrushModeler.log.");break;}if(!ApplySkinOverrides(sourceExp,m.skinOverride,mergeSourceExp)){fail("Could not apply derived model materials for "+m.asset+". See BrushModeler.log.");break;}
-      std::wostringstream args;args<<L"\""<<workingExport<<L"\" \""<<mergeSourceExp<<L"\" "<<m.origin[0]<<L" "<<m.origin[1]<<L" "<<m.origin[2]<<L" "<<centerArray[0]<<L" "<<centerArray[1]<<L" "<<centerArray[2]<<L" "<<m.angles[0]<<L" "<<m.angles[1]<<L" "<<m.angles[2];if(i==0&&brushGuids.empty())args<<L" --allow-empty-base";
-     if(Run(mergeTool,args.str(),outDir)!=0){fail("Model merge failed for "+m.asset+". Check BrushModeler.log and the bundled merge helper.");break;}
-     if(i==0&&brushGuids.empty()){if(!MoveFileExW(workingExport.c_str(),exp.c_str(),MOVEFILE_REPLACE_EXISTING)){fail("Could not finalize the models-only XModel export.");FileLog("could not finalize models-only export error=%lu",GetLastError());break;}workingExport=exp;}
-     FileLog("selected model merged: index=%zu asset=%s source=%s",i,m.asset.c_str(),WideUtf8(m.bin).c_str());
+      if(i)manifest<<",\n";std::wstring mergeExportName=mergeSourceExp.substr(mergeSourceExp.find_last_of(L"\\/")+1);manifest<<"  {\"export\":\""<<WideUtf8(mergeExportName)<<"\",\"origin\":["<<m.origin[0]<<","<<m.origin[1]<<","<<m.origin[2]<<"],\"center\":["<<centerArray[0]<<","<<centerArray[1]<<","<<centerArray[2]<<"],\"angles\":["<<m.angles[0]<<","<<m.angles[1]<<","<<m.angles[2]<<"]}";
+     FileLog("selected model exported for batch merge: index=%zu asset=%s source=%s",i,m.asset.c_str(),WideUtf8(m.bin).c_str());
     }
     if(!error.empty())break;
+    if(!queued.empty()){manifest<<"\n]\n";manifest.close();if(!manifest){fail("Could not finish the temporary model merge manifest.");break;}std::wostringstream args;args<<L"--merge-many \""<<baseExp<<L"\" \""<<modelManifest<<L"\"";if(brushGuids.empty())args<<L" --allow-empty-base";auto mergeStarted=GetTickCount64();if(Run(mergeTool,args.str(),outDir)!=0){fail("Model merge failed. Check BrushModeler.log and the bundled merge helper.");break;}FileLog("batch model merge complete: models=%zu elapsed_ms=%llu",queued.size(),(unsigned long long)(GetTickCount64()-mergeStarted));for(size_t i=0;i<queued.size();++i)FileLog("selected model merged: index=%zu asset=%s source=%s",i,queued[i].asset.c_str(),WideUtf8(queued[i].bin).c_str());}
+    if(!error.empty())break;
     if(queued.empty()){std::wostringstream args;args<<L"--optimize-only \""<<exp<<L"\"";if(Run(mergeTool,args.str(),outDir)!=0){fail("Mesh cleanup failed for the brush/patch model. Check BrushModeler.log and the bundled merge helper.");break;}}
-    if(!queued.empty()&&!brushGuids.empty()&&workingExport!=exp){if(!MoveFileExW(workingExport.c_str(),exp.c_str(),MOVEFILE_REPLACE_EXISTING)){fail("Could not finalize the merged XModel export.");FileLog("could not finalize merged export error=%lu",GetLastError());break;}}
+    if(!queued.empty()&&baseExp!=exp){if(!MoveFileExW(baseExp.c_str(),exp.c_str(),MOVEFILE_REPLACE_EXISTING)){fail("Could not finalize the merged XModel export.");FileLog("could not finalize merged export error=%lu",GetLastError());break;}}
     g_buildPhase.store(3,std::memory_order_release);std::wstring bin=Join(outDir,Utf8Wide(asset)+L".xmodel_bin");DeleteFileW(bin.c_str());std::wstring converter=Join(Join(root,L"bin"),L"export2bin.exe");
     if(Run(converter,L"/v \""+Utf8Wide(asset)+L".xmodel_export\"",outDir)!=0||GetFileAttributesW(bin.c_str())==INVALID_FILE_ATTRIBUTES){fail("export2bin failed; see BrushModeler.log beside the DLL.");break;}
     if(!IsGdtTarget(gdtText)){fail("Refusing to write: the GDT target must end in .gdt.");break;}std::string gdt;{std::ifstream r(Utf8Wide(gdtText),std::ios::binary);if(r)gdt.assign(std::istreambuf_iterator<char>(r),{});}if(gdt.empty()){fail("Could not read the selected GDT file.");break;}
     g_buildPhase.store(4,std::memory_order_release);std::string entry="\n\t\""+asset+"\" ( \"xmodel.gdf\" )\n\t{\n\t\t\"BulletCollisionLOD\" \"None\"\n\t\t\"filename\" \""+gdtOutputPath+"\\\\"+asset+".xmodel_bin\"\n\t\t\"type\" \"rigid\"\n\t}\n";std::regex oldEntry("\""+asset+"\"\\s*\\(\\s*\"xmodel\\.gdf\"\\s*\\)\\s*\\{[^}]*\\}",std::regex::icase);gdt=std::regex_replace(gdt,oldEntry,"");size_t end=gdt.rfind('}');if(end==std::string::npos){fail("Selected GDT file has invalid brace structure.");break;}gdt.insert(end,entry);{std::string writeError;if(!WriteGdtAtomically(Utf8Wide(gdtText),gdt,writeError)){fail(writeError);break;}}
     if(Run(Join(Join(root,L"gdtdb"),L"gdtdb.exe"),L"/update",root)!=0){fail("Model built and GDT updated, but gdtdb /update failed. See log.");break;}
-    if(cleanExports){size_t removed=0,failed=0;auto removeGenerated=[&](const std::wstring&path){if(DeleteFileW(path.c_str()))++removed;else{DWORD error=GetLastError();if(error!=ERROR_FILE_NOT_FOUND&&error!=ERROR_PATH_NOT_FOUND){++failed;FileLog("cleanExports could not remove generated file error=%lu path=%s",error,WideUtf8(path).c_str());}}};removeGenerated(exp);if(baseExp!=exp)removeGenerated(baseExp);for(size_t i=0;i<queued.size();++i){std::wstring sourceStem=Join(outDir,L"queued_source_"+std::to_wstring(i));removeGenerated(sourceStem+L".xmodel_bin");removeGenerated(sourceStem+L".xmodel_export");removeGenerated(sourceStem+L".xmodel_export.skin_override.xmodel_export");}FileLog("cleanExports completed: removed=%zu failed=%zu",removed,failed);}else FileLog("cleanExports disabled; generated .xmodel_export and queued source .xmodel_bin files retained");
+    if(cleanExports){size_t removed=0,failed=0;auto removeGenerated=[&](const std::wstring&path){if(DeleteFileW(path.c_str()))++removed;else{DWORD error=GetLastError();if(error!=ERROR_FILE_NOT_FOUND&&error!=ERROR_PATH_NOT_FOUND){++failed;FileLog("cleanExports could not remove generated file error=%lu path=%s",error,WideUtf8(path).c_str());}}};removeGenerated(exp);if(baseExp!=exp)removeGenerated(baseExp);if(!queued.empty())removeGenerated(modelManifest);for(size_t i=0;i<queued.size();++i){std::wstring sourceStem=Join(outDir,L"queued_source_"+std::to_wstring(i));removeGenerated(sourceStem+L".xmodel_bin");removeGenerated(sourceStem+L".xmodel_export");removeGenerated(sourceStem+L".xmodel_export.skin_override.xmodel_export");}FileLog("cleanExports completed: removed=%zu failed=%zu",removed,failed);}else FileLog("cleanExports disabled; generated .xmodel_export, merge manifest and queued source .xmodel_bin files retained");
     g_buildPhase.store(5,std::memory_order_release);char mapbuf[1024]{};snprintf(mapbuf,sizeof mapbuf,"{\n\"classname\" \"worldspawn\"\n}\n{\n\"classname\" \"misc_model\"\n\"model\" \"%s\"\n\"origin\" \"%.3f %.3f %.3f\"\n}\n",asset.c_str(),centerArray[0],centerArray[1],centerArray[2]);map=mapbuf;FileLog("background asset build completed: asset=%s merged_models=%zu source_brushes=%zu",asset.c_str(),queued.size(),brushGuids.size());
    }while(false);
    {std::lock_guard<std::mutex> lock(g_buildMutex);g_buildError=error;g_buildMap=map;}g_buildWorkerDone.store(true,std::memory_order_release);
@@ -327,7 +329,7 @@ void OnUnload()
 int OnLoad()
 {
  if(!rp::InRadiant())return 1;
- std::wstring dll=rp::PluginDir();g_log=Join(dll,L"BrushModeler.log");Log("=== BrushModeler 0.3.9 OnLoad ===");
+ std::wstring dll=rp::PluginDir();g_log=Join(dll,L"BrushModeler.log");Log("=== BrushModeler 0.3.11 OnLoad ===");
  if(!rp::host->ui)return 1;
  const auto*u=rp::host->ui;auto root=u->Widget(nullptr);auto box=u->VBox(root);
  u->LayoutMargins(box,7,6,7,6);u->LayoutSpacing(box,5);
@@ -357,4 +359,4 @@ int OnLoad()
  else Status("Ready: build brushes/patches directly, or queue selected models for merge before building.");}}
 }void OnSettings(){if(g_pane)rp::host->ShowPane(rp::self,g_pane,1);}
 }
-extern "C" MODTOOLS_PLUGIN_EXPORT const ModToolsPluginApi* ModToolsPluginEntry(ModToolsPlugin*self,const ModToolsHostApi*host){rp::Bind(self,host);static ModToolsPluginApi a{};a.size=sizeof a;a.apiVersion=MODTOOLS_PLUGIN_API_VERSION;a.name="BrushModeler";a.displayName="Brush Modeler";a.version="0.3.10";a.author="Owen";a.description="Convert selected Radiant brushes and merge selected BO3 models into an XModel.";a.apps=MODTOOLS_APP_RADIANT;a.OnLoad=OnLoad;a.OnUnload=OnUnload;a.OnTick=OnTick;a.OnSettings=OnSettings;return &a;}
+extern "C" MODTOOLS_PLUGIN_EXPORT const ModToolsPluginApi* ModToolsPluginEntry(ModToolsPlugin*self,const ModToolsHostApi*host){rp::Bind(self,host);static ModToolsPluginApi a{};a.size=sizeof a;a.apiVersion=MODTOOLS_PLUGIN_API_VERSION;a.name="BrushModeler";a.displayName="Brush Modeler";a.version="0.3.11";a.author="Owen";a.description="Convert selected Radiant brushes and merge selected BO3 models into an XModel.";a.apps=MODTOOLS_APP_RADIANT;a.OnLoad=OnLoad;a.OnUnload=OnUnload;a.OnTick=OnTick;a.OnSettings=OnSettings;return &a;}

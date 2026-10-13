@@ -1,3 +1,10 @@
+# Brush Modeler 0.3.11
+
+## Fixed
+
+- Merged queued models in one helper pass. Previously, every model caused the complete accumulated export to be parsed, optimized, and rewritten again, making large selections progressively slower.
+- Kept per-model transform auditing while running mesh cleanup once for the finished combined export.
+
 # Brush Modeler 0.3.10
 
 ## Added and improved
