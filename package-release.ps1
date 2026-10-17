@@ -1,18 +1,18 @@
 param(
-    [string]$Version = "0.3.11",
+    [string]$Version = "",   # defaults to BRUSHMODELER_VERSION in Version.h
     [string]$Bo3Root = "D:\SteamLibrary\steamapps\common\Call of Duty Black Ops III",
-    [string]$Python = ""
+    [string]$Changes = "Merging now runs inside the plugin (no merge_xmodels.exe), with collision and pivot options, tool-face skipping and per-brush materials.",
+    [switch]$SkipTests
 )
 $ErrorActionPreference = "Stop"
-if ($Version -notmatch '^\d+(\.\d+)*$') { throw "Version must contain only numbers and dots." }
 $plugin = Split-Path -Parent $MyInvocation.MyCommand.Path
-$repo = $plugin
-$monorepo = Join-Path $plugin "..\.."
-if (Test-Path -LiteralPath (Join-Path $monorepo "RadiantPlugins.sln")) { $repo = (Resolve-Path $monorepo).Path }
-if ([string]::IsNullOrWhiteSpace($Python)) {
-    $localPython = Join-Path $plugin "build\python\python.exe"
-    $Python = if (Test-Path -LiteralPath $localPython) { $localPython } else { "python" }
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    $match = Select-String -LiteralPath (Join-Path $plugin "Version.h") -Pattern '#define BRUSHMODELER_VERSION "([^"]+)"'
+    if (!$match) { throw "BRUSHMODELER_VERSION not found in Version.h." }
+    $Version = $match.Matches[0].Groups[1].Value
 }
+if ($Version -notmatch '^\d+(\.\d+)*$') { throw "Version must contain only numbers and dots." }
+$repo = Resolve-Path (Join-Path $plugin "..\..")
 $distRoot = Join-Path $repo "dist"
 $out = Join-Path $distRoot "BrushModeler-$Version"
 $candidate = Join-Path $out "BrushModeler"
@@ -24,8 +24,10 @@ $msbuild = @(
 ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 if (!$msbuild) { throw "MSBuild not found in the known Visual Studio locations." }
 
-& (Join-Path $plugin "build-merge-helper.ps1") -Python $Python
-if ($LASTEXITCODE -ne 0) { throw "Merge helper build failed." }
+if (!$SkipTests) {
+    & (Join-Path $plugin "Tests\RunTests.ps1") -Bo3Root $Bo3Root
+    if (!$?) { throw "Tests failed." }
+}
 & $msbuild (Join-Path $plugin "BrushModeler.vcxproj") /t:Build /p:Configuration=Release /p:Platform=x64 /p:DeployToGame=false "/p:Bo3Root=$Bo3Root" /v:m /nologo
 if ($LASTEXITCODE -ne 0) { throw "Brush Modeler DLL build failed." }
 
@@ -39,7 +41,6 @@ New-Item -ItemType Directory -Force -Path (Join-Path $candidate "Tools"),(Join-P
 $releaseFiles = @(
     @{ Source=(Join-Path $plugin "bin\Release\BrushModeler.dll"); Relative="BrushModeler.dll" },
     @{ Source=(Join-Path $plugin "BrushModeler.ini"); Relative="BrushModeler.ini" },
-    @{ Source=(Join-Path $plugin "merge_xmodels.exe"); Relative="merge_xmodels.exe" },
     @{ Source=(Join-Path $plugin "README.md"); Relative="README.md" },
     @{ Source=(Join-Path $plugin "CHANGELOG.md"); Relative="CHANGELOG.md" },
     @{ Source=(Join-Path $plugin "THIRD_PARTY_NOTICES.md"); Relative="THIRD_PARTY_NOTICES.md" },
@@ -63,8 +64,8 @@ $indexEntry = [ordered]@{
     displayName = "Brush Modeler"
     author = "Owen"
     version = $Version
-    description = "Convert selected Radiant brushes and patches to XModels, and merge selected BO3 models."
-    changes = "Merges queued models in one pass to avoid repeated reprocessing as the selection grows."
+    description = "Convert selected Radiant brushes and patches to XModels, merge selected BO3 models, and create mirrored model assets."
+    changes = $Changes
     apps = @("radiant")
     apiVersion = 1
     files = $files

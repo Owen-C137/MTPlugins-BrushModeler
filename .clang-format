@@ -1,0 +1,9 @@
+BasedOnStyle: Microsoft
+ColumnLimit: 140
+SortIncludes: Never
+AllowShortFunctionsOnASingleLine: All
+PointerAlignment: Left
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: true
+AllowShortLambdasOnASingleLine: All
+AllowShortBlocksOnASingleLine: Empty
